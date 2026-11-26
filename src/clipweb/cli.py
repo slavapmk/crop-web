@@ -206,9 +206,10 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                             pending = data[complete_bytes:]
                             pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
                             current_second = min(int(duration), max(0, int(start)))
-                            bar.update(max(0, current_second - last_audio_second))
-                            last_audio_second = current_second
-                            bar.set_postfix(elapsed=f"{current_second/60:.1f}m", remaining=f"{max(0, duration-current_second)/60:.1f}m")
+                            if current_second > last_audio_second:
+                                bar.update(current_second - last_audio_second)
+                                last_audio_second = current_second
+                                bar.set_postfix(elapsed=f"{current_second/60:.1f}m", remaining=f"{max(0, duration-current_second)/60:.1f}m")
                     for out in resampler.resample(None):
                         data = pending + out.to_ndarray().tobytes()
                         complete_bytes = len(data) // frame_bytes * frame_bytes
@@ -231,6 +232,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
         try:
             with av.open(str(path)) as container:
                 video = container.streams.video[0]
+                video.thread_type = "AUTO"
                 with StageBar(total=frame_count, desc="Video", unit="frame", position=3, leave=False, dynamic_ncols=True, progress=progress, stage="video") as bar:
                     next_sample = 0.0
                     for frame in container.decode(video=0):
@@ -431,11 +433,39 @@ def _smoking_predictor(model_path: Path, settings: dict, logger: logging.Logger)
     return predict
 
 
+def _sample_video_frames(video, stream, sample_times, linear_gap: float = 2.0):
+    """Reuse the decoder for nearby samples; seek for distant intervals."""
+    decoded_frames = None
+    current_frame = None
+    current_time = None
+    for sample_time in sample_times:
+        if (decoded_frames is None or current_time is None
+                or sample_time < current_time - linear_gap
+                or sample_time - current_time > linear_gap):
+            video.seek(max(0, int(sample_time / float(stream.time_base))),
+                       stream=stream, backward=True, any_frame=False)
+            decoded_frames = iter(video.decode(video=0))
+            current_frame = None
+            current_time = None
+        while current_time is None or current_time + 1e-6 < sample_time:
+            frame = next(decoded_frames, None)
+            if frame is None:
+                current_frame = None
+                current_time = None
+                break
+            current_frame = frame
+            current_time = (float(frame.pts * frame.time_base)
+                            if frame.pts is not None else sample_time)
+            if frame.pts is None:
+                decoded_frames = None
+                break
+        yield current_frame, current_time
+
+
 def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict,
                    model_path: Path, logger: logging.Logger, progress: FileProgress | None = None) -> list[tuple[float, float]]:
     """Find smoking events only inside already-retained face/silent ranges."""
     s = cfg["smoking"]
-    predict = _smoking_predictor(model_path, s, logger)
 
     fps = float(s["sample_fps"])
     if fps <= 0:
@@ -449,6 +479,7 @@ def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict
     if not sample_times:
         return []
 
+    predict = _smoking_predictor(model_path, s, logger)
     video = av.open(str(source))
     stream = video.streams.video[0]
     box = cfg["webcam"]
@@ -456,15 +487,7 @@ def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict
     model_size = int(s["input_size"])
     hits: list[float] = []
     with StageBar(total=len(sample_times), desc="Smoking", unit="frame", position=2, leave=False, dynamic_ncols=True, progress=progress, stage="smoking") as bar:
-        for sample_time in sample_times:
-            video.seek(max(0, int(sample_time / float(stream.time_base))),
-                       stream=stream, backward=True, any_frame=False)
-            frame = None
-            for decoded in video.decode(video=0):
-                timestamp = float(decoded.pts * decoded.time_base) if decoded.pts is not None else sample_time
-                if timestamp + 1e-6 >= sample_time:
-                    frame = decoded
-                    break
+        for sample_time, (frame, timestamp) in zip(sample_times, _sample_video_frames(video, stream, sample_times)):
             if frame is not None:
                 image = frame.to_ndarray(format="bgr24")
                 crop = image[max(0, y):min(image.shape[0], y+h),
