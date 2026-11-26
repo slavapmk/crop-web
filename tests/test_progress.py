@@ -1,16 +1,24 @@
 import threading
 import unittest
 from unittest.mock import patch
+from tqdm import tqdm
 
 from clipweb.cli import FileProgress
 
 
 class FakeBar:
+    format_interval = staticmethod(tqdm.format_interval)
+
     def __init__(self, *args, **kwargs):
         self.n = 0.0
+        self.total = kwargs.get("total", 1)
+        self.format_dict = {"elapsed": 1.0}
 
     def update(self, amount):
         self.n += amount
+
+    def set_postfix_str(self, *args, **kwargs):
+        pass
 
     def close(self):
         pass

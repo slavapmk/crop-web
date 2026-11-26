@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from tqdm import tqdm
 import webrtcvad
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
-SUMMARY_BAR_FORMAT = "{desc:<7}: {percentage:3.0f}%|{bar:24}| [{elapsed}]"
+SUMMARY_BAR_FORMAT = "{desc:<7}: {percentage:3.0f}%|{bar:24}| [{elapsed}]{postfix}"
 STAGE_BAR_FORMAT = "{desc:<7}: {percentage:3.0f}%|{bar:24}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}, {rate_fmt}]{postfix}"
 
 
@@ -114,6 +115,42 @@ def _speech_evidence(speech_counts: np.ndarray, audio_counts: np.ndarray,
     return vad_presence, moving
 
 
+class EtaEstimator:
+    """Estimate concurrent analysis plus sequential stages from observed rates."""
+
+    def __init__(self, stages: tuple[str, ...]):
+        self.started: dict[str, float] = {}
+        self.finished: dict[str, float] = {}
+        self.stages = stages
+
+    def start(self, stage: str, now: float) -> None:
+        self.started.setdefault(stage, now)
+
+    def finish(self, stage: str, now: float) -> None:
+        if stage in self.started:
+            self.finished.setdefault(stage, now)
+
+    def remaining(self, values: dict[str, float], now: float) -> float | None:
+        durations = {}
+        for stage, started in self.started.items():
+            fraction = values[stage]
+            if fraction >= 0.01:
+                elapsed = max(0.0, self.finished.get(stage, now) - started)
+                durations[stage] = elapsed / fraction
+        analysis_times = [durations[s] for s in ("audio", "video") if s in durations]
+        reference = max(analysis_times, default=max(durations.values(), default=0.0))
+        if not reference:
+            return 0.0 if all(values[s] >= 1 for s in self.stages) else None
+        remaining = {
+            stage: (0.0 if values[stage] >= 1 else
+                    durations.get(stage, reference) * (1 - values[stage]))
+            for stage in self.stages
+        }
+        parallel = max((remaining.get(s, 0.0) for s in ("audio", "video")), default=0.0)
+        return parallel + sum(value for stage, value in remaining.items()
+                              if stage not in {"audio", "video"})
+
+
 class FileProgress:
     """Track equally weighted stages, including concurrent analysis tasks."""
 
@@ -122,17 +159,40 @@ class FileProgress:
         self.stages = {name: 0.0 for name in stages}
         self.lock = threading.RLock()
         self.value = 0.0
+        self.eta = EtaEstimator(stages)
+        self.last_eta = 0.0
         self.bar = tqdm(total=100, desc="File", unit="%", position=1, leave=False,
                         dynamic_ncols=True, bar_format=SUMMARY_BAR_FORMAT)
+        self.bar.set_postfix_str("ETA ~?", refresh=False)
+
+    def start(self, stage: str) -> None:
+        with self.lock:
+            self.eta.start(stage, time.monotonic())
 
     def update(self, stage: str, fraction: float) -> None:
         with self.lock:
             self.stages[stage] = max(self.stages[stage], min(1.0, max(0.0, fraction)))
+            now = time.monotonic()
+            if self.stages[stage] >= 1:
+                self.eta.finish(stage, now)
             value = sum(self.stages.values()) / len(self.stages)
             delta = value - self.value
             self.value = value
             self.bar.update(delta * 100)
             self.overall.update(delta)
+            if now - self.last_eta >= 1 or value >= 1:
+                remaining = self.eta.remaining(self.stages, now)
+                if remaining is None:
+                    file_eta = overall_eta = "ETA ~?"
+                else:
+                    future_files = max(0, math.ceil(self.overall.total - self.overall.n - (1 - value) - 1e-9))
+                    elapsed = self.bar.format_dict["elapsed"]
+                    total_remaining = remaining + future_files * (elapsed + remaining)
+                    file_eta = f"ETA ~{tqdm.format_interval(remaining)}"
+                    overall_eta = f"ETA ~{tqdm.format_interval(total_remaining)}"
+                self.bar.set_postfix_str(file_eta, refresh=False)
+                self.overall.set_postfix_str(overall_eta, refresh=False)
+                self.last_eta = now
 
     def close(self) -> None:
         self.bar.close()
@@ -142,6 +202,8 @@ class StageBar(tqdm):
     def __init__(self, *args, progress: FileProgress | None = None, stage: str = "", **kwargs):
         self.progress = progress
         self.stage = stage
+        if progress is not None:
+            progress.start(stage)
         kwargs.setdefault("bar_format", STAGE_BAR_FORMAT)
         super().__init__(*args, **kwargs)
 
@@ -634,8 +696,11 @@ def main() -> None:
         had_errors = False
         overall = tqdm(total=len(sources), desc="Overall", unit="file", position=0,
                        dynamic_ncols=True, bar_format=SUMMARY_BAR_FORMAT)
+        overall.set_postfix_str("ETA ~?", refresh=False)
         for source in sources:
             progress = FileProgress(overall, ("audio", "video", "smoking", "render"))
+            if not cfg["smoking"]["enabled"]:
+                progress.update("smoking", 1.0)
             if not source.is_file():
                 logger.error("Файл не найден: %s", source)
                 had_errors = True
