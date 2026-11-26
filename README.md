@@ -32,3 +32,7 @@ The analysis log reports the percentage of samples with a detected face, voice a
 [Русская версия](README.ru.md)
 
 Audio and video analysis run concurrently with separate decoders. The overall and per-file bars represent equally weighted audio analysis, video analysis, smoking detection and rendering stages; they are progress estimates, not elapsed-time predictions. Cached or disabled stages complete immediately. Concurrent reads can increase load on the storage and CPU.
+
+The default `both` mode uses the fraction of voiced audio frames in the local window and requires repeated mouth movement (`analysis.mouth_motion_ratio`, default `0.5`). Increase this value to reduce motion-triggered cuts, at the cost of keeping more actual speech; the mouth-motion heuristic does not distinguish speech, eating, drinking or head movement. Analysis cache entries from older versions are invalidated.
+
+On Windows, `smoking.backend: auto` tries ONNX Runtime DirectML (`smoking.device_id: 0`) and logs the selected provider; unsupported operators may run on CPU. It falls back to OpenCV CPU if initialization fails. Use `directml` to require DirectML or `cpu` to force CPU. The video decode, face detection and VAD remain CPU operations; model speed does not determine overall throughput. Adapter IDs follow DXGI enumeration and can change with system configuration.

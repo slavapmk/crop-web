@@ -7,7 +7,15 @@ name = "clipweb"
 version = "0.1.0"
 description = "Keep silent webcam moments from recorded streams"
 requires-python = ">=3.11"
-dependencies = ["av>=14.0", "numpy>=2.0", "opencv-python-headless>=4.10,<5", "PyYAML>=6.0", "tqdm>=4.66", "webrtcvad-wheels>=2.0.14"]
+dependencies = [
+    "av>=14.0",
+    "numpy>=2.0",
+    "onnxruntime-directml>=1.20 ; sys_platform == 'win32'",
+    "opencv-python-headless>=4.10,<5",
+    "PyYAML>=6.0",
+    "tqdm>=4.66",
+    "webrtcvad-wheels>=2.0.14",
+]
 
 [project.scripts]
 clipweb = "clipweb.cli:main"

@@ -48,6 +48,7 @@ def load_config(path: Path) -> dict:
         "paths": {"input": "input", "output": "output", "source": None},
         "analysis": {"sample_fps": 5, "audio_sample_rate": 16000, "audio_frame_ms": 30,
                      "vad_aggressiveness": 2, "lip_motion_threshold": 2.8, "speech_ratio": .2,
+                     "mouth_motion_ratio": .5,
                      "window_seconds": .6, "speech_padding_seconds": .35,
                      "face_missing_tolerance_seconds": 2,
                      "speech_detection": "both", "invert_speech": False},
@@ -55,7 +56,7 @@ def load_config(path: Path) -> dict:
                     "sample_fps": 2.0, "input_size": 640, "confidence": .35,
                     "min_hits": 2, "max_gap_seconds": 2.5,
                     "padding_before_seconds": 1.0, "padding_after_seconds": 2.0,
-                    "merge_gap_seconds": 4.0, "threads": 2},
+                    "merge_gap_seconds": 4.0, "threads": 2, "backend": "auto", "device_id": 0},
         "output": {"video_codec": "libx264", "preset": "veryfast", "crf": 23,
                    "audio_codec": "aac", "audio_bitrate": "160k", "join_gap_seconds": .25},
     }
@@ -65,6 +66,9 @@ def load_config(path: Path) -> dict:
             config[section].setdefault(key, value)
     if config["analysis"]["speech_detection"] not in {"face", "speech", "both", "mouth"}:
         raise ValueError("analysis.speech_detection must be face, speech, both, or mouth")
+    for name in ("speech_ratio", "mouth_motion_ratio"):
+        if not 0 < float(config["analysis"][name]) <= 1:
+            raise ValueError(f"analysis.{name} must be greater than zero and at most one")
     return config
 
 
@@ -93,6 +97,19 @@ def _mouth_motion(current: np.ndarray, previous: np.ndarray | None) -> float:
 
 def _sample_index(timestamp: float, step: float, frame_count: int) -> int:
     return min(frame_count - 1, max(0, int((timestamp + 1e-6) / step)))
+
+
+def _speech_evidence(speech_counts: np.ndarray, audio_counts: np.ndarray,
+                     mouth_grid: np.ndarray, cfg: dict, step: float) -> tuple[np.ndarray, np.ndarray]:
+    radius = max(1, int(round(float(cfg["window_seconds"]) / step / 2)))
+    window = np.ones(2 * radius + 1)
+    voiced = np.convolve(np.pad(speech_counts, (radius, radius)), window, mode="valid")
+    audio_total = np.convolve(np.pad(audio_counts, (radius, radius)), window, mode="valid")
+    vad_presence = (audio_total > 0) & (voiced >= float(cfg["speech_ratio"]) * audio_total)
+    motion = mouth_grid >= float(cfg["lip_motion_threshold"])
+    count = np.convolve(np.pad(motion.astype(float), (radius, radius)), window, mode="valid")
+    moving = count >= max(1, math.ceil(float(cfg["mouth_motion_ratio"]) * len(window)))
+    return vad_presence, moving
 
 
 class FileProgress:
@@ -145,7 +162,8 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
     detector = _face_detector()
     step = 1.0 / float(a["sample_fps"])
     frame_count = max(1, math.ceil(duration / step))
-    speech_grid = np.zeros(frame_count, dtype=bool)
+    speech_counts = np.zeros(frame_count, dtype=np.int32)
+    audio_counts = np.zeros(frame_count, dtype=np.int32)
     face_grid = np.zeros(frame_count, dtype=bool)
     mouth_grid = np.zeros(frame_count, dtype=float)
     previous = None
@@ -181,9 +199,10 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                                     spoken = vad.is_speech(data[offset:offset + frame_bytes], sample_rate)
                                 except Exception:
                                     spoken = False
+                                idx = min(frame_count - 1, max(0, int(stamp / step)))
+                                audio_counts[idx] += 1
                                 if spoken:
-                                    idx = min(frame_count - 1, max(0, int(stamp / step)))
-                                    speech_grid[idx] = True
+                                    speech_counts[idx] += 1
                             pending = data[complete_bytes:]
                             pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
                             current_second = min(int(duration), max(0, int(start)))
@@ -195,9 +214,10 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                         complete_bytes = len(data) // frame_bytes * frame_bytes
                         origin = pending_start or 0.0
                         for offset in range(0, complete_bytes, frame_bytes):
+                            idx = min(frame_count - 1, max(0, int((origin + offset / 2 / sample_rate) / step)))
+                            audio_counts[idx] += 1
                             if vad.is_speech(data[offset:offset + frame_bytes], sample_rate):
-                                idx = min(frame_count - 1, max(0, int((origin + offset / 2 / sample_rate) / step)))
-                                speech_grid[idx] = True
+                                speech_counts[idx] += 1
                         pending = data[complete_bytes:]
                         pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
                     bar.update(max(0, int(duration) - last_audio_second))
@@ -250,12 +270,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
     if progress is not None:
         progress.update("video", 1.0)
     # Speech evidence requires voice activity coincident with mouth motion, reducing game/other voices.
-    radius = max(1, int(round(float(a["window_seconds"]) / step / 2)))
-    window = np.ones(2 * radius + 1)
-    voiced = np.convolve(np.pad(speech_grid.astype(float), (radius, radius)), window, mode="valid")
-    vad_presence = voiced >= max(1, float(a["speech_ratio"]) * (2*radius+1))
-    moving_grid = mouth_grid >= float(a["lip_motion_threshold"])
-    moving = np.convolve(np.pad(moving_grid.astype(float), (radius, radius)), window, mode="valid") > 0
+    vad_presence, moving = _speech_evidence(speech_counts, audio_counts, mouth_grid, a, step)
     speech = vad_presence.copy()
     if a["speech_detection"] == "both":
         speech &= moving
@@ -325,7 +340,7 @@ def _analysis_cache_path(output_dir: Path, source: Path) -> Path:
 def _analysis_signature(source: Path, cfg: dict) -> str:
     stat = source.stat()
     data = {
-        "analysis_version": 2,
+        "analysis_version": 3,
         "source": str(source.resolve()),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
@@ -377,14 +392,50 @@ def _smoking_signature(base_signature: str, cfg: dict, model_path: Path) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _smoking_predictor(model_path: Path, settings: dict, logger: logging.Logger):
+    backend = settings["backend"]
+    if backend not in {"auto", "cpu", "directml"}:
+        raise ValueError("smoking.backend must be auto, cpu, or directml")
+    if backend != "cpu":
+        try:
+            import onnxruntime as ort
+            if "DmlExecutionProvider" not in ort.get_available_providers():
+                raise RuntimeError("DirectML execution provider is unavailable")
+            options = ort.SessionOptions()
+            options.enable_mem_pattern = False
+            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            options.intra_op_num_threads = int(settings["threads"])
+            session = ort.InferenceSession(
+                str(model_path), sess_options=options,
+                providers=[("DmlExecutionProvider", {"device_id": int(settings["device_id"])}),
+                           "CPUExecutionProvider"])
+            session.disable_fallback()
+            if "DmlExecutionProvider" not in session.get_providers():
+                raise RuntimeError("DirectML initialization fell back to CPU")
+            input_name = session.get_inputs()[0].name
+            logger.info("Smoking inference: DirectML adapter %d (unsupported operations may use CPU)",
+                        int(settings["device_id"]))
+            return lambda blob: session.run(None, {input_name: blob})[0]
+        except Exception as exc:
+            if backend == "directml":
+                raise RuntimeError(f"DirectML initialization failed: {exc}") from exc
+            logger.warning("DirectML unavailable, using CPU: %s", exc)
+    cv2.setNumThreads(int(settings["threads"]))
+    net = cv2.dnn.readNetFromONNX(str(model_path))
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    logger.info("Smoking inference: OpenCV CPU")
+    def predict(blob: np.ndarray) -> np.ndarray:
+        net.setInput(blob)
+        return net.forward()
+    return predict
+
+
 def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict,
                    model_path: Path, logger: logging.Logger, progress: FileProgress | None = None) -> list[tuple[float, float]]:
     """Find smoking events only inside already-retained face/silent ranges."""
     s = cfg["smoking"]
-    cv2.setNumThreads(int(s["threads"]))
-    net = cv2.dnn.readNetFromONNX(str(model_path))
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    predict = _smoking_predictor(model_path, s, logger)
 
     fps = float(s["sample_fps"])
     if fps <= 0:
@@ -428,8 +479,7 @@ def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict
                     canvas[top:top+rh, left:left+rw] = resized
                     blob = cv2.dnn.blobFromImage(canvas, 1/255.0, (model_size, model_size),
                                                  swapRB=True, crop=False)
-                    net.setInput(blob)
-                    prediction = np.asarray(net.forward())
+                    prediction = np.asarray(predict(blob))
                     if prediction.ndim == 3 and prediction.shape[0] == 1:
                         prediction = prediction[0]
                         if prediction.shape[0] < prediction.shape[1]:
