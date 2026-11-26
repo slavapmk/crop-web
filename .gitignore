@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+work/
+output/.clipweb_cache/
+config.toml
