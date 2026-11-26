@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-clipweb = "clipweb.cli:main"
+clipweb = "clipweb.cli:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/clipweb"]

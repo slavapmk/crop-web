@@ -46,3 +46,25 @@ The console shows overall, per-file and stage progress. Overall percentages give
 Run `uv run python -m unittest discover -s tests`. To measure and enforce the 95% line-coverage minimum, run `uv run python -m coverage run --source=clipweb -m unittest discover -s tests` followed by `uv run python -m coverage report`. Tests requiring FFmpeg are skipped if it is unavailable. Detection and output correctness depend on the source, webcam geometry, codec and model; review representative episodes before processing important material. Multiple faces or large layout changes can confuse automatic detection. Timestamps without presentation timestamps or in non-monotonic order cannot be mapped reliably to frame numbers and are rejected instead of guessed. Output names are zero-based video-frame indices, not audio sample numbers.
 
 If Windows temporarily denies FFmpeg access to an episode temporary file, the program retries up to three times using fresh temporary files. Persistent access failures are logged and the file is not reported as successfully rendered.
+
+## Run one job from a workflow
+
+From the project directory:
+
+```powershell
+uv run clipweb --config D:/jobs/job-42.yaml --source D:/media/movie.mp4
+```
+
+Use [config.example.yaml](config.example.yaml) as the job configuration template. Set every processing
+option and the output directory in that YAML. Relative paths inside the YAML
+are resolved from its directory.
+The two CLI paths are resolved from the process working directory.
+Omit `--source` for the regular configured input selection. A successful run
+exits with code 0. Check the expected artifact before passing it to the next
+stage. The output layout is `<stem>_clipweb.mp4 or an episode directory`.
+
+Pass the command as an argument list to `subprocess.run` with
+`cwd` set to this project directory and `check=True`. Independent jobs can run
+in separate processes. Use distinct output directories for jobs whose paths
+could collide, and wait for each input's prior stage to finish before starting
+its next stage.

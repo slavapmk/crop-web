@@ -836,18 +836,21 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
             blur_path.unlink(missing_ok=True)
 
 
-def main() -> None:
+def main(config_path: Path = Path("config.yaml"), *, source: Path | None = None) -> None:
     logger = setup_logging()
     try:
-        config_path = Path("config.yaml").resolve()
+        config_path = config_path.resolve()
         cfg = load_config(config_path)
         root = config_path.parent
         logger = setup_logging(cfg, root)
         logger.debug("Loaded configuration from %s", config_path)
-        source_value = cfg["paths"].get("source")
+        source_value = source.resolve() if source is not None else cfg["paths"].get("source")
         input_dir = (root / cfg["paths"]["input"]).resolve()
         output_dir = (root / cfg["paths"]["output"]).resolve()
-        input_dir.mkdir(parents=True, exist_ok=True)
+        if source is None:
+            input_dir.mkdir(parents=True, exist_ok=True)
+        elif not source.is_file() or source.suffix.lower() not in VIDEO_EXTENSIONS:
+            raise ValueError(f"Invalid video source: {source}")
         output_dir.mkdir(parents=True, exist_ok=True)
         if source_value:
             one = Path(source_value)
@@ -993,5 +996,16 @@ def main() -> None:
         sys.exit(1)
 
 
+
+def cli(argv=None):
+    """Parse command-line arguments and run the selected job."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="clipweb")
+    parser.add_argument("--config", type=Path, default=Path("config.yaml"))
+    parser.add_argument("--source", type=Path, help="Process only this video")
+    args = parser.parse_args(argv)
+    return main(args.config, source=args.source)
+
 if __name__ == "__main__":
-    main()
+    cli()

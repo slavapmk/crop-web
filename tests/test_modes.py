@@ -48,6 +48,21 @@ class ModeTests(unittest.TestCase):
             cli.main()
         return detect, analysis, smoking, episodes, joined
 
+    def test_cli_selects_external_source(self):
+        selected = self.root / "previous.mp4"
+        selected.touch()
+        Path("job.yaml").write_text(
+            "webcam: {auto: false}\nsmoking: {enabled: false}\n"
+            "paths: {source: input, output: job-output}\n",
+            encoding="utf-8",
+        )
+        with patch.object(cli, "analyze_video", return_value=([(0., 90.)], 90.)) as analysis, \
+             patch.object(cli, "render_episodes") as episodes:
+            cli.cli(["--config", "job.yaml", "--source", str(selected)])
+        analysis.assert_called_once()
+        self.assertEqual(analysis.call_args.args[0], selected)
+        self.assertEqual(episodes.call_args.args[1], self.root / "job-output" / "previous")
+
     def test_default_modules_are_independent(self):
         detect, analysis, smoking, episodes, joined = self.run_modules({})
         detect.assert_called_once()
