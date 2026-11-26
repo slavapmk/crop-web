@@ -1,6 +1,7 @@
 import io
 import re
 import unittest
+from unittest.mock import Mock
 from tqdm import tqdm
 from clipweb.cli import SUMMARY_BAR_FORMAT, StageBar
 
@@ -32,3 +33,13 @@ class ProgressFormattingTests(unittest.TestCase):
         with StageBar(total=10, desc='Render', file=output, mininterval=0, ascii=True) as bar:
             bar.update(20)
             self.assertEqual(bar.n, 10)
+
+    def test_stage_reports_fraction_to_overall_progress(self):
+        progress = Mock()
+        with StageBar(total=10, desc='Video', file=io.StringIO(), mininterval=0,
+                      progress=progress, stage='video') as bar:
+            bar.update(5)
+            bar.update(5)
+        progress.start.assert_called_once_with('video')
+        self.assertEqual(progress.update.call_args_list[0].args, ('video', .5))
+        self.assertEqual(progress.update.call_args_list[1].args, ('video', 1.))

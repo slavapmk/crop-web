@@ -1,0 +1,70 @@
+# All paths are relative to this configuration file unless absolute.
+paths:
+  input: input
+  output: output
+  source: null
+
+# episodes: one file per face-present, non-smoking episode; legacy: one joined file.
+processing:
+  mode: episodes
+  reanalyze: false
+  face_missing_tolerance_seconds: 0.0
+  # 0 keeps all non-empty episodes.
+  min_segment_seconds: 0.0
+
+# A single stable webcam rectangle is selected for the whole recording.
+webcam:
+  auto: true
+  samples: 24
+  # Used when auto is false, and in legacy mode.
+  x: 976
+  y: 540
+  width: 304
+  height: 180
+
+analysis:
+  sample_fps: 5
+  audio_sample_rate: 16000
+  audio_frame_ms: 30
+  vad_aggressiveness: 2
+  lip_motion_threshold: 2.8
+  mouth_motion_ratio: 0.5
+  speech_ratio: 0.2
+  window_seconds: 0.6
+  speech_padding_seconds: 0.35
+  face_missing_tolerance_seconds: 2.0
+  # These two settings apply only in legacy mode.
+  speech_detection: both
+  invert_speech: false
+
+smoking:
+  enabled: true
+  model: models/smoking_detector.onnx
+  backend: auto
+  device_id: 0
+  sample_fps: 2.0
+  input_size: 640
+  confidence: 0.35
+  min_hits: 2
+  max_gap_seconds: 2.5
+  padding_before_seconds: 1.0
+  padding_after_seconds: 2.0
+  merge_gap_seconds: 4.0
+  threads: 2
+
+output:
+  # Fixed center crop in episodes mode; use source to retain webcam dimensions.
+  aspect_ratio: '16:10'
+  video_codec: libx264
+  preset: veryfast
+  crf: 23
+  audio_codec: aac
+  audio_bitrate: 160k
+  # In legacy mode, join retained intervals separated by less than this.
+  join_gap_seconds: 0.25
+  # Used in legacy mode only.
+  min_segment_seconds: 0.5
+
+logging:
+  console_level: INFO
+  file_level: DEBUG

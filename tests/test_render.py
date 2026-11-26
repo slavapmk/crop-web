@@ -53,3 +53,18 @@ class RenderIntegrationTests(unittest.TestCase):
                     rendered = read_at(result, position + middle)
                     self.assertLess(float(np.mean(cv2.absdiff(original, rendered))), 7.)
                     position += end - start
+
+    def test_ffmpeg_failure_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.mp4'
+            subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=128x96:rate=10:duration=1', '-c:v', 'libx264',
+                            str(source)], check=True, capture_output=True)
+            config_file = root / 'config.yaml'
+            config_file.write_text('{}', encoding='utf8')
+            cfg = load_config(config_file)
+            cfg['webcam'] = dict(x=0, y=0, width=128, height=96)
+            cfg['output']['video_codec'] = 'nonexistent_codec'
+            with self.assertRaisesRegex(RuntimeError, 'ffmpeg failed'):
+                render_video(source, root / 'bad.mp4', [(0., .5)], cfg, logging.getLogger('test'))

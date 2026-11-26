@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -10,7 +10,9 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 import av
@@ -19,10 +21,12 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 import webrtcvad
+from clipweb.webcam import detect_webcam
+from clipweb.episodes import render_episodes
+from clipweb.aspect import crop_to_aspect
+from clipweb.progress import SUMMARY_BAR_FORMAT, STAGE_BAR_FORMAT
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
-SUMMARY_BAR_FORMAT = "{desc:<7}: {percentage:3.0f}%|{bar:24}| [{elapsed}]{postfix}"
-STAGE_BAR_FORMAT = "{desc:<7}: {percentage:3.0f}%|{bar:24}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}, {rate_fmt}]{postfix}"
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -33,13 +37,32 @@ class TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
-def setup_logging() -> logging.Logger:
+class EventFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        record.event_id = f"E{zlib.crc32(str(record.msg).encode('utf-8')):08X}"
+        return super().format(record)
+
+
+def setup_logging(cfg: dict | None = None, root: Path | None = None) -> logging.Logger:
     logger = logging.getLogger("clipweb")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
+    for previous in logger.handlers:
+        previous.close()
     logger.handlers.clear()
     handler = TqdmLoggingHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"))
+    settings = cfg["logging"] if cfg is not None else {"console_level": "INFO"}
+    handler.setLevel(settings["console_level"].upper())
+    formatter = EventFormatter("%(asctime)s | %(levelname)-8s | %(event_id)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    handler.setFormatter(formatter)
     logger.addHandler(handler)
+    if cfg is not None and root is not None:
+        log_dir = root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_dir / f"{datetime.now():%Y%m%d_%H%M%S_%f}.log", encoding="utf-8")
+        file_handler.setLevel(settings["file_level"].upper())
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    logger.propagate = False
     return logger
 
 
@@ -47,7 +70,10 @@ def load_config(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream) or {}
     defaults = {
-        "webcam": {"x": 976, "y": 540, "width": 304, "height": 180},
+        "webcam": {"auto": True, "samples": 24, "x": 976, "y": 540, "width": 304, "height": 180},
+        "processing": {"mode": "episodes", "face_missing_tolerance_seconds": 0.0,
+                       "min_segment_seconds": 0.0, "reanalyze": False},
+        "logging": {"console_level": "INFO", "file_level": "DEBUG"},
         "paths": {"input": "input", "output": "output", "source": None},
         "analysis": {"sample_fps": 5, "audio_sample_rate": 16000, "audio_frame_ms": 30,
                      "vad_aggressiveness": 2, "lip_motion_threshold": 2.8, "speech_ratio": .2,
@@ -62,7 +88,7 @@ def load_config(path: Path) -> dict:
                     "merge_gap_seconds": 4.0, "threads": 2, "backend": "auto", "device_id": 0},
         "output": {"video_codec": "libx264", "preset": "veryfast", "crf": 23,
                    "audio_codec": "aac", "audio_bitrate": "160k", "join_gap_seconds": .25,
-                   "min_segment_seconds": .5},
+                   "min_segment_seconds": .5, "aspect_ratio": "16:10"},
     }
     for section, values in defaults.items():
         config.setdefault(section, {})
@@ -70,6 +96,12 @@ def load_config(path: Path) -> dict:
             config[section].setdefault(key, value)
     if config["analysis"]["speech_detection"] not in {"face", "speech", "both", "mouth"}:
         raise ValueError("analysis.speech_detection must be face, speech, both, or mouth")
+    if config["processing"]["mode"] not in {"episodes", "legacy"}:
+        raise ValueError("processing.mode must be episodes or legacy")
+    if float(config["processing"]["face_missing_tolerance_seconds"]) < 0:
+        raise ValueError("processing.face_missing_tolerance_seconds must be nonnegative")
+    if float(config["processing"]["min_segment_seconds"]) < 0:
+        raise ValueError("processing.min_segment_seconds must be nonnegative")
     for name in ("speech_ratio", "mouth_motion_ratio"):
         if not 0 < float(config["analysis"][name]) <= 1:
             raise ValueError(f"analysis.{name} must be greater than zero and at most one")
@@ -238,7 +270,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
     face_grid = np.zeros(frame_count, dtype=bool)
     mouth_grid = np.zeros(frame_count, dtype=float)
     previous = None
-    logger.info("Анализ: %s (%.1f мин., шаг %.2f с)", path.name, duration / 60, step)
+    logger.info("Analyze: %s (%.1f min, step %.2f s)", path.name, duration / 60, step)
     # Each decoder owns its container; PyAV containers are not shared across threads.
     stop_audio = threading.Event()
     def analyze_audio() -> None:
@@ -294,7 +326,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                         pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
                     bar.update(max(0, int(duration) - last_audio_second))
         elif not has_audio and a["speech_detection"] in {"speech", "both"}:
-            logger.warning("Аудиодорожка не найдена; речь можно оценить только по движению лица")
+            logger.warning("No audio stream; audio-based speech detection is unavailable")
         if progress is not None:
             progress.update("audio", 1.0)
     # Analyze audio and video concurrently using independent demuxers.
@@ -320,7 +352,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                             faces = detector.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=4, minSize=(40, 40))
                             present = len(faces) > 0
                             face_grid[idx] = present
-                            if present:
+                            if present and a["speech_detection"] != "face":
                                 # Use the largest detected face; surrounding webcam movement cannot
                                 # dominate the mouth-motion score.
                                 face = max(faces, key=lambda item: int(item[2]) * int(item[3]))
@@ -328,7 +360,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                                 motion = _mouth_motion(mouth, previous)
                                 mouth_grid[idx] = motion
                                 previous = mouth
-                            else:
+                            elif not present:
                                 previous = None
                         # Anchor sampling to the fixed grid, not to the last decoded frame.
                         # Otherwise frame-rate rounding accumulates and leaves false face gaps.
@@ -356,7 +388,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
     else:
         keep = face_grid & (~speech if not a["invert_speech"] else speech)
     if mode == "face" and a["invert_speech"]:
-        logger.warning("invert_speech действует только в режимах speech/both")
+        logger.warning("invert_speech has no effect in face mode")
     # Remove a small guard interval around speech so word edges are not left audible.
     padding = max(0, int(math.ceil(float(a["speech_padding_seconds"]) / step)))
     if padding and mode != "face":
@@ -598,7 +630,7 @@ def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict
         for group in groups if len(group) >= int(s["min_hits"])
     ]
     events = merge_intervals(events, float(s["merge_gap_seconds"]))
-    logger.info("Найдено вероятных эпизодов курения: %d", len(events))
+    logger.info("Detected probable smoking events: %d", len(events))
     return events
 
 
@@ -623,9 +655,9 @@ def filter_short_intervals(intervals: list[tuple[float, float]], minimum: float)
     return [(start, end) for start, end in intervals if end - start + 1e-9 >= minimum]
 
 
-def render_video(source: Path, target: Path, intervals: list[tuple[float, float]], cfg: dict, logger: logging.Logger, progress: FileProgress | None = None) -> None:
+def render_video(source: Path, target: Path, intervals: list[tuple[float, float]], cfg: dict, logger: logging.Logger, progress: FileProgress | None = None, show_progress: bool = True) -> None:
     if not intervals:
-        logger.warning("Нет подходящих фрагментов: %s", source.name)
+        logger.warning("No suitable fragments: %s", source.name)
         return
     # Let the concat demuxer seek directly to each interval. A trim/concat filter graph
     # has to decode the entire long recording and becomes very slow with hundreds of cuts.
@@ -655,11 +687,12 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
                     "-c:a", out["audio_codec"], "-b:a", out["audio_bitrate"]]
         cmd += ["-progress", "pipe:1", str(target)]
         duration = sum(end - start for start, end in intervals)
-        logger.info("Сборка %s: %.1f мин. из %d фрагментов (переходы к отрезкам)", target.name, duration/60, len(intervals))
+        logger.log(logging.INFO if show_progress else logging.DEBUG,
+                   "Render %s: %.1f min, %d intervals", target.name, duration/60, len(intervals))
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errors:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, text=True, bufsize=1)
             try:
-                with StageBar(total=max(0.1, duration), desc="Render", unit="s", position=2, leave=False, dynamic_ncols=True, progress=progress, stage="render") as bar:
+                with StageBar(total=max(0.1, duration), desc="Render", unit="s", position=2, leave=False, dynamic_ncols=True, progress=progress, stage="render", disable=not show_progress) as bar:
                     last = 0.0
                     assert proc.stdout is not None
                     for line in proc.stdout:
@@ -684,17 +717,14 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Оставляет молчащие моменты с лицом в вебке")
-    parser.add_argument("--config", default="config.yaml", help="Путь к config.yaml")
-    parser.add_argument("--source", help="Обработать один файл вместо всей input-папки")
-    parser.add_argument("--reanalyze", action="store_true", help="Не использовать сохранённые результаты анализа")
-    args = parser.parse_args()
     logger = setup_logging()
     try:
-        config_path = Path(args.config).resolve()
+        config_path = Path("config.yaml").resolve()
         cfg = load_config(config_path)
         root = config_path.parent
-        source_value = args.source or cfg["paths"].get("source")
+        logger = setup_logging(cfg, root)
+        logger.debug("Loaded configuration from %s", config_path)
+        source_value = cfg["paths"].get("source")
         input_dir = (root / cfg["paths"]["input"]).resolve()
         output_dir = (root / cfg["paths"]["output"]).resolve()
         input_dir.mkdir(parents=True, exist_ok=True)
@@ -707,7 +737,7 @@ def main() -> None:
         else:
             sources = sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS)
         if not sources:
-            logger.info("В %s нет видео. Положите туда файл или задайте paths.source в config.yaml", input_dir)
+            logger.info("No videos in %s; add a file or set paths.source in config.yaml", input_dir)
             return
         had_errors = False
         overall = tqdm(total=len(sources), desc="Overall", unit="file", position=0,
@@ -718,57 +748,81 @@ def main() -> None:
             if not cfg["smoking"]["enabled"]:
                 progress.update("smoking", 1.0)
             if not source.is_file():
-                logger.error("Файл не найден: %s", source)
+                logger.error("File not found: %s", source)
                 had_errors = True
                 for stage in progress.stages:
                     progress.update(stage, 1.0)
                 progress.close()
                 continue
             try:
-                signature = _analysis_signature(source, cfg)
+                file_cfg = copy.deepcopy(cfg)
+                episode_mode = file_cfg["processing"]["mode"] == "episodes"
+                if episode_mode:
+                    if file_cfg["webcam"]["auto"]:
+                        box = detect_webcam(source, int(file_cfg["webcam"]["samples"]), logger)
+                        file_cfg["webcam"].update(box)
+                    file_cfg["webcam"] = crop_to_aspect(file_cfg["webcam"], file_cfg["output"]["aspect_ratio"])
+                    logger.info("Fixed output rectangle: x=%d y=%d width=%d height=%d (aspect=%s)",
+                                file_cfg["webcam"]["x"], file_cfg["webcam"]["y"],
+                                file_cfg["webcam"]["width"], file_cfg["webcam"]["height"],
+                                file_cfg["output"]["aspect_ratio"])
+                    file_cfg["analysis"]["speech_detection"] = "face"
+                    file_cfg["analysis"]["invert_speech"] = False
+                    file_cfg["analysis"]["face_missing_tolerance_seconds"] = float(
+                        file_cfg["processing"]["face_missing_tolerance_seconds"])
+                    file_cfg["output"]["join_gap_seconds"] = 0.0
+                    file_cfg["output"]["min_segment_seconds"] = float(file_cfg["processing"]["min_segment_seconds"])
+                    logger.info("Episode mode: speech detection disabled; smoking filter enabled=%s",
+                                file_cfg["smoking"]["enabled"])
+                signature = _analysis_signature(source, file_cfg)
                 cache_path = _analysis_cache_path(output_dir, source)
-                cached = None if args.reanalyze else _load_analysis_cache(cache_path, signature)
+                cached = None if file_cfg["processing"]["reanalyze"] else _load_analysis_cache(cache_path, signature)
                 if cached is None:
-                    intervals, duration = analyze_video(source, cfg, logger, progress)
+                    intervals, duration = analyze_video(source, file_cfg, logger, progress)
                     _save_analysis_cache(cache_path, signature, intervals, duration)
-                    logger.info("Результат анализа сохранён до сборки")
+                    logger.info("Analysis saved before rendering")
                 else:
                     intervals, duration = cached
-                    logger.info("Использую сохранённый анализ для %s", source.name)
+                    logger.info("Using cached analysis for %s", source.name)
                 progress.update("audio", 1.0)
                 progress.update("video", 1.0)
-                intervals = merge_intervals(intervals, float(cfg["output"]["join_gap_seconds"]))
-                if cfg["smoking"]["enabled"]:
-                    model_path = Path(cfg["smoking"]["model"])
+                intervals = merge_intervals(intervals, float(file_cfg["output"]["join_gap_seconds"]))
+                if file_cfg["smoking"]["enabled"]:
+                    model_path = Path(file_cfg["smoking"]["model"])
                     if not model_path.is_absolute():
                         model_path = (root / model_path).resolve()
                     if not model_path.is_file():
-                        raise FileNotFoundError(f"Модель курения не найдена: {model_path}")
+                        raise FileNotFoundError(f"Smoking model not found: {model_path}")
                     smoking_cache = _smoking_cache_path(output_dir, source)
-                    smoking_signature = _smoking_signature(signature, cfg, model_path)
-                    cached_smoking = None if args.reanalyze else _load_analysis_cache(smoking_cache, smoking_signature)
+                    smoking_signature = _smoking_signature(signature, file_cfg, model_path)
+                    cached_smoking = None if file_cfg["processing"]["reanalyze"] else _load_analysis_cache(smoking_cache, smoking_signature)
                     if cached_smoking is None:
-                        smoking_events = detect_smoking(source, intervals, cfg, model_path, logger, progress)
+                        smoking_events = detect_smoking(source, intervals, file_cfg, model_path, logger, progress)
                         _save_analysis_cache(smoking_cache, smoking_signature, smoking_events, duration)
                     else:
                         smoking_events, _ = cached_smoking
-                        logger.info("Использую сохранённый анализ курения для %s", source.name)
+                        logger.info("Using cached smoking analysis for %s", source.name)
                     intervals = subtract_intervals(intervals, smoking_events)
                     logger.info("Selected after smoking filter: %.1f%%",
                                 100 * sum(end - start for start, end in intervals) / duration)
-                    logger.info("После вырезания курения осталось фрагментов: %d", len(intervals))
+                    logger.info("Remaining intervals after smoking removal: %d", len(intervals))
                 progress.update("smoking", 1.0)
                 before = len(intervals)
-                intervals = filter_short_intervals(intervals, float(cfg["output"]["min_segment_seconds"]))
+                intervals = filter_short_intervals(intervals, float(file_cfg["output"]["min_segment_seconds"]))
                 logger.info("Removed %d short fragments; %d remain (%.1f min)", before - len(intervals),
                             len(intervals), sum(end - start for start, end in intervals) / 60)
-                target = output_dir / f"{source.stem}_clipweb.mp4"
-                render_video(source, target, intervals, cfg, logger, progress)
-                logger.info("Готово: %s (сохранено %.1f%% длительности)", target.name,
+                target = output_dir / source.stem if episode_mode else output_dir / f"{source.stem}_clipweb.mp4"
+                if episode_mode:
+                    episode_cache = cache_path.with_name(cache_path.stem + "_episodes.json")
+                    render_episodes(source, target, episode_cache, intervals, file_cfg, logger,
+                                    render_video, progress, StageBar)
+                else:
+                    render_video(source, target, intervals, file_cfg, logger, progress)
+                logger.info("Finished: %s (retained %.1f%% of source duration)", target.name,
                             100 * sum(e-s for s, e in intervals) / duration if intervals else 0)
             except Exception as exc:
                 had_errors = True
-                logger.exception("Ошибка при обработке %s: %s", source.name, exc)
+                logger.exception("Failed to process %s: %s", source.name, exc)
             finally:
                 for stage in progress.stages:
                     progress.update(stage, 1.0)
@@ -777,7 +831,7 @@ def main() -> None:
         if had_errors:
             sys.exit(1)
     except Exception as exc:
-        logger.exception("Ошибка конфигурации/запуска: %s", exc)
+        logger.exception("Configuration or startup failed: %s", exc)
         sys.exit(1)
 
 

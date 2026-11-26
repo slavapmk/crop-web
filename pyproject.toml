@@ -22,3 +22,12 @@ clipweb = "clipweb.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/clipweb"]
+
+[tool.coverage.report]
+fail_under = 95
+precision = 2
+
+[dependency-groups]
+dev = [
+    "coverage>=7.17.5",
+]
