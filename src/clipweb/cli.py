@@ -710,7 +710,12 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
                     assert proc.stdout is not None
                     for line in proc.stdout:
                         if line.startswith("out_time_ms="):
-                            now = int(line.partition("=")[2] or 0) / 1_000_000
+                            raw_time = line.partition("=")[2].strip()
+                            try:
+                                now = int(raw_time) / 1_000_000
+                            except ValueError:
+                                logger.debug("Ignoring unavailable FFmpeg progress timestamp: %s", raw_time)
+                                continue
                             bar.update(max(0.0, now-last)); last = now
                         elif line.startswith("progress=end"):
                             bar.update(max(0.0, duration-last))

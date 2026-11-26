@@ -1,8 +1,10 @@
 import logging
+import io
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import av
@@ -76,6 +78,29 @@ class RenderIntegrationTests(unittest.TestCase):
             cfg['output']['video_codec'] = 'nonexistent_codec'
             with self.assertRaisesRegex(RuntimeError, 'ffmpeg failed'):
                 render_video(source, root / 'bad.mp4', [(0., .5)], cfg, logging.getLogger('test'))
+
+    def test_unavailable_progress_timestamp_does_not_abort_render(self):
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = io.StringIO('out_time_ms=N/A\nout_time_ms=250000\nprogress=end\n')
+            def wait(self): return 0
+            def poll(self): return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.mp4'
+            subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=128x96:rate=10:duration=1', '-c:v', 'libx264',
+                            str(source)], check=True, capture_output=True)
+            config_file = root / 'config.yaml'
+            config_file.write_text('{}', encoding='utf8')
+            cfg = load_config(config_file)
+            cfg['webcam'] = dict(x=0, y=0, width=128, height=96)
+            process = FakeProcess()
+            with patch('subprocess.Popen', return_value=process):
+                render_video(source, root / 'out.mp4', [(0., .5)], cfg,
+                             logging.getLogger('test'), show_progress=False)
+            self.assertTrue(process.stdout.closed)
 
     def test_mute_removes_audio_from_joined_and_separate_exports(self):
         with tempfile.TemporaryDirectory() as tmp:
