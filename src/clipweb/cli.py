@@ -76,6 +76,7 @@ def load_config(path: Path) -> dict:
         "face": {"enabled": True, "missing_tolerance_seconds": 0.0},
         "speech": {"enabled": False, "method": "both", "invert": False},
         "aspect": {"enabled": True, "ratio": "16:10"},
+        "mute": {"enabled": False},
         "logging": {"console_level": "INFO", "file_level": "DEBUG"},
         "paths": {"input": "input", "output": "output", "source": None},
         "analysis": {"sample_fps": 5, "audio_sample_rate": 16000, "audio_frame_ms": 30,
@@ -101,6 +102,7 @@ def load_config(path: Path) -> dict:
         raise ValueError("face.missing_tolerance_seconds must be nonnegative")
     for section, key in (("webcam", "enabled"), ("webcam", "auto"), ("face", "enabled"), ("speech", "enabled"),
                          ("speech", "invert"), ("smoking", "enabled"), ("aspect", "enabled"),
+                         ("mute", "enabled"),
                          ("output", "split_episodes"), ("processing", "reanalyze")):
         if not isinstance(config[section][key], bool):
             raise ValueError(f"{section}.{key} must be true or false")
@@ -672,7 +674,7 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
     # has to decode the entire long recording and becomes very slow with hundreds of cuts.
     import subprocess
     probe = av.open(str(source))
-    has_audio = bool(probe.streams.audio)
+    has_audio = bool(probe.streams.audio) and not cfg["mute"]["enabled"]
     probe.close()
     out = cfg["output"]
     manifest_path: Path | None = None
@@ -694,6 +696,8 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
         if has_audio:
             cmd += ["-map", "0:a:0", "-af", "aselect=concatdec_select,aresample=async=1",
                     "-c:a", out["audio_codec"], "-b:a", out["audio_bitrate"]]
+        else:
+            cmd += ["-an"]
         cmd += ["-progress", "pipe:1", str(target)]
         duration = sum(end - start for start, end in intervals)
         logger.log(logging.INFO if show_progress else logging.DEBUG,
@@ -775,9 +779,10 @@ def main() -> None:
                 logger.info("Fixed output rectangle: x=%d y=%d width=%d height=%d",
                             file_cfg["webcam"]["x"], file_cfg["webcam"]["y"],
                             file_cfg["webcam"]["width"], file_cfg["webcam"]["height"])
-                logger.info("Modules: webcam=%s face=%s speech=%s smoking=%s aspect=%s split_episodes=%s",
+                logger.info("Modules: webcam=%s face=%s speech=%s smoking=%s aspect=%s mute=%s split_episodes=%s",
                             file_cfg["webcam"]["enabled"], file_cfg["face"]["enabled"], file_cfg["speech"]["enabled"],
                             file_cfg["smoking"]["enabled"], file_cfg["aspect"]["enabled"],
+                            file_cfg["mute"]["enabled"],
                             file_cfg["output"]["split_episodes"])
                 signature = _analysis_signature(source, file_cfg)
                 cache_path = _analysis_cache_path(output_dir, source)

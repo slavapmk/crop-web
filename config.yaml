@@ -37,6 +37,10 @@ aspect:
   enabled: true
   ratio: '16:10'
 
+# Remove the audio track from exported files; speech analysis is unaffected.
+mute:
+  enabled: false
+
 # Shared analysis parameters.
 analysis:
   sample_fps: 5

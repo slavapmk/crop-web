@@ -62,7 +62,7 @@ class CacheAndDetectorTests(unittest.TestCase):
     def test_config_rejects_invalid_modes_and_ratios(self):
         for text in ('face: {enabled: wrong}', 'analysis: {speech_ratio: 0}',
                      'speech: {method: bad}',
-                     'output: {min_segment_seconds: -1}', 'output: {split_episodes: maybe}',
+                     'output: {min_segment_seconds: -1}', 'output: {split_episodes: maybe}', 'mute: {enabled: maybe}',
                      'face: {missing_tolerance_seconds: -1}'):
             path = self.root / 'bad.yaml'; path.write_text(text, encoding='utf8')
             with self.subTest(text=text), self.assertRaises(ValueError): cli.load_config(path)

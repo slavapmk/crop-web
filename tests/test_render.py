@@ -10,6 +10,14 @@ import cv2
 import numpy as np
 
 from clipweb.cli import filter_short_intervals, load_config, render_video
+from clipweb.episodes import render_episodes
+
+
+class QuietBar:
+    def __init__(self, **kwargs): pass
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def update(self, n): pass
 
 
 class FragmentTests(unittest.TestCase):
@@ -68,3 +76,37 @@ class RenderIntegrationTests(unittest.TestCase):
             cfg['output']['video_codec'] = 'nonexistent_codec'
             with self.assertRaisesRegex(RuntimeError, 'ffmpeg failed'):
                 render_video(source, root / 'bad.mp4', [(0., .5)], cfg, logging.getLogger('test'))
+
+    def test_mute_removes_audio_from_joined_and_separate_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.mp4'
+            subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                            '-f', 'lavfi', '-i', 'testsrc2=size=128x96:rate=10:duration=3',
+                            '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=3',
+                            '-c:v', 'libx264', '-c:a', 'aac', '-shortest', str(source)],
+                           check=True, capture_output=True)
+            config_file = root / 'config.yaml'
+            config_file.write_text('{}', encoding='utf8')
+            cfg = load_config(config_file)
+            cfg['webcam'] = dict(x=0, y=0, width=128, height=96)
+            intervals = [(.2, 1.), (1.5, 2.5)]
+            reference = root / 'with-audio.mp4'
+            render_video(source, reference, intervals, cfg, logging.getLogger('test'), show_progress=False)
+            cfg['mute']['enabled'] = True
+            muted = root / 'muted.mp4'
+            render_video(source, muted, intervals, cfg, logging.getLogger('test'), show_progress=False)
+            folder = root / 'episodes'
+            render_episodes(source, folder, root / 'cache' / 'episodes.json', intervals, cfg,
+                            logging.getLogger('test'), render_video, None, QuietBar)
+            with av.open(str(reference)) as audible, av.open(str(muted)) as silent:
+                self.assertTrue(audible.streams.audio)
+                self.assertFalse(silent.streams.audio)
+                self.assertEqual(sum(1 for _ in audible.decode(video=0)),
+                                 sum(1 for _ in silent.decode(video=0)))
+            outputs = list(folder.glob('*.mp4'))
+            self.assertEqual(len(outputs), 2)
+            for path in outputs:
+                with av.open(str(path)) as container:
+                    self.assertFalse(container.streams.audio)
+                    self.assertTrue(container.streams.video)

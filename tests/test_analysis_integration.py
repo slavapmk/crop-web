@@ -105,6 +105,7 @@ class AnalysisIntegrationTests(unittest.TestCase):
     def test_audio_only_speech_filter_works_without_face_detector(self):
         self.cfg['face']['enabled'] = False
         self.cfg['speech'].update(enabled=True, method='speech')
+        self.cfg['mute']['enabled'] = True
         with patch.object(cli, '_face_detector', side_effect=AssertionError('face detector must not run')), \
              patch.object(cli.webrtcvad, 'Vad', Voice):
             intervals, _ = cli.analyze_video(self.video, self.cfg, self.logger)
