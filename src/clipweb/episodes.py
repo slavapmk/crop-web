@@ -10,6 +10,7 @@ from pathlib import Path
 import av
 from tqdm import tqdm
 from clipweb.progress import STAGE_BAR_FORMAT
+from clipweb.smoking_regions import Region
 
 
 _FRAME_NAME = re.compile(r'^\d+-\d+\.mp4$')
@@ -74,7 +75,7 @@ def index_intervals(source: Path, intervals: list[tuple[float, float]]) -> list[
 
 def render_episodes(source: Path, folder: Path, cache_path: Path, intervals: list[tuple[float, float]],
                     cfg: dict, logger: logging.Logger, render, progress, stage_bar,
-                    blur_intervals: list[tuple[float, float]] | None = None) -> None:
+                    blur_regions: list[Region] | None = None) -> None:
     episodes = index_intervals(source, intervals)
     folder.mkdir(parents=True, exist_ok=True)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,9 +104,9 @@ def render_episodes(source: Path, folder: Path, cache_path: Path, intervals: lis
             os.close(fd)
             temp_path = Path(temporary)
             try:
-                if blur_intervals:
+                if blur_regions:
                     render(source, temp_path, [(start, end)], cfg, logger,
-                           show_progress=False, blur_intervals=blur_intervals)
+                           show_progress=False, blur_regions=blur_regions)
                 else:
                     render(source, temp_path, [(start, end)], cfg, logger, show_progress=False)
                 os.replace(temp_path, folder / name)

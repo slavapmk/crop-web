@@ -11,7 +11,8 @@ import av
 import cv2
 import numpy as np
 
-from clipweb.cli import _map_blur_intervals, filter_short_intervals, load_config, render_video
+from clipweb.cli import filter_short_intervals, load_config, render_video
+from clipweb.smoking_regions import map_regions
 from clipweb.episodes import render_episodes
 
 
@@ -28,18 +29,17 @@ class FragmentTests(unittest.TestCase):
         self.assertEqual(filter_short_intervals(items, .5), items[1:])
         self.assertEqual(filter_short_intervals(items, 0), items)
 
-    def test_smoking_timestamps_are_mapped_across_cuts(self):
+    def test_smoking_regions_are_mapped_across_cuts(self):
         intervals = [(1., 2.), (4., 6.)]
-        events = [(1.2, 1.5), (4.1, 4.4), (5.5, 7.)]
-        actual = _map_blur_intervals(intervals, events)
+        regions = [(1.2, 1.5, 10, 10, 20, 20), (4.1, 4.4, 30, 20, 12, 8),
+                   (5.5, 7., 50, 40, 10, 10)]
+        actual = map_regions(intervals, regions)
         expected = [(0.2, 0.5), (1.1, 1.4), (2.5, 3.)]
         self.assertEqual(len(actual), len(expected))
         for pair, reference in zip(actual, expected):
             self.assertAlmostEqual(pair[0], reference[0])
             self.assertAlmostEqual(pair[1], reference[1])
 
-    def test_overlapping_blur_events_do_not_shrink(self):
-        self.assertEqual(_map_blur_intervals([(0., 10.)], [(1., 5.), (2., 3.)]), [(1., 5.)])
 
 
 @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is required')
@@ -163,11 +163,11 @@ class RenderIntegrationTests(unittest.TestCase):
             cfg = load_config(config_file)
             cfg['webcam'] = dict(x=0, y=0, width=128, height=96)
             intervals = [(.6, 1.6), (3., 5.)]
-            events = [(.9, 1.3), (3.6, 4.1)]
+            regions = [(.9, 1.3, 32, 24, 40, 30), (3.6, 4.1, 70, 40, 28, 24)]
             baseline, blurred = root / 'baseline.mp4', root / 'blurred.mp4'
             logger = logging.getLogger('test')
             render_video(source, baseline, intervals, cfg, logger, show_progress=False)
-            render_video(source, blurred, intervals, cfg, logger, show_progress=False, blur_intervals=events)
+            render_video(source, blurred, intervals, cfg, logger, show_progress=False, blur_regions=regions)
             def image_at(container, timestamp):
                 stream = container.streams.video[0]
                 container.seek(int(timestamp / float(stream.time_base)), stream=stream, backward=True)
@@ -180,24 +180,28 @@ class RenderIntegrationTests(unittest.TestCase):
                     diff = np.mean(cv2.absdiff(image_at(original, timestamp), image_at(result, timestamp)))
                     self.assertLess(diff, 6., f'unexpected blur at {timestamp}s')
                 for timestamp in (.3, .5, 1.6, 1.8):
-                    diff = np.mean(cv2.absdiff(image_at(original, timestamp), image_at(result, timestamp)))
-                    self.assertGreater(diff, 8., f'blur missing at {timestamp}s')
+                    diff = cv2.absdiff(image_at(original, timestamp), image_at(result, timestamp))
+                    region = diff[24:54, 32:72] if timestamp < 1. else diff[40:64, 70:98]
+                    self.assertGreater(np.mean(region), 8., f'blur missing at {timestamp}s')
+                    self.assertLess(np.mean(diff[0:16, 0:20]), 7., f'outside region blurred at {timestamp}s')
             baseline_dir, blurred_dir = root / 'split-original', root / 'split-blurred'
             render_episodes(source, baseline_dir, root / 'cache' / 'original.json', intervals,
                             cfg, logger, render_video, None, QuietBar)
             render_episodes(source, blurred_dir, root / 'cache' / 'blurred.json', intervals,
-                            cfg, logger, render_video, None, QuietBar, blur_intervals=events)
+                            cfg, logger, render_video, None, QuietBar, blur_regions=regions)
             for index, name in enumerate(('18-47.mp4', '90-149.mp4')):
                 with av.open(str(baseline_dir / name)) as original, av.open(str(blurred_dir / name)) as result:
                     self.assertTrue(result.streams.audio)
                     outside, inside = (.1, .5) if index == 0 else (.2, .8)
                     self.assertLess(np.mean(cv2.absdiff(image_at(original, outside), image_at(result, outside))), 6.)
-                    self.assertGreater(np.mean(cv2.absdiff(image_at(original, inside), image_at(result, inside))), 8.)
+                    difference = cv2.absdiff(image_at(original, inside), image_at(result, inside))
+                    area = difference[24:54, 32:72] if index == 0 else difference[40:64, 70:98]
+                    self.assertGreater(np.mean(area), 8.)
             boundary = root / 'boundary.mp4'
             render_video(source, boundary, [intervals[0]], cfg, logger, show_progress=False,
-                         blur_intervals=[(0., 1.1)])
+                         blur_regions=[(0., 1.1, 32, 24, 40, 30)])
             with av.open(str(baseline)) as original, av.open(str(boundary)) as result:
-                self.assertGreater(np.mean(cv2.absdiff(image_at(original, .1), image_at(result, .1))), 8.)
+                self.assertGreater(np.mean(cv2.absdiff(image_at(original, .1), image_at(result, .1))[24:54, 32:72]), 8.)
                 self.assertLess(np.mean(cv2.absdiff(image_at(original, .8), image_at(result, .8))), 6.)
 
     def test_blur_command_file_handles_special_characters_in_temp_path(self):
@@ -215,7 +219,7 @@ class RenderIntegrationTests(unittest.TestCase):
             cfg['webcam'] = dict(x=0, y=0, width=128, height=96)
             with patch('tempfile.tempdir', str(command_dir)):
                 render_video(source, output, [(0., 2.)], cfg, logging.getLogger('test'),
-                             show_progress=False, blur_intervals=[(.5, 1.5)])
+                             show_progress=False, blur_regions=[(.5, 1.5, 32, 24, 40, 30)])
             with av.open(str(output)) as container:
                 self.assertTrue(container.streams.video)
             self.assertFalse(list(command_dir.glob('cw_blur_*.txt')))

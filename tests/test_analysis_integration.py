@@ -129,3 +129,14 @@ class AnalysisIntegrationTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertLessEqual(events[0][0], 0.)
         self.assertGreater(events[0][1], 2.)
+
+    def test_smoking_positions_are_collected_from_model_boxes(self):
+        self.cfg['smoking']['blur_near_mouth'] = False
+        output = np.zeros((1, 5, 10), dtype=np.float32)
+        output[0, :, 0] = (320, 320, 80, 60, .9)
+        positions = []
+        with patch.object(cli, '_smoking_predictor', return_value=lambda blob: output):
+            cli.detect_smoking(self.video, [(0., 1.)], self.cfg, Path('unused'), self.logger,
+                               positions=positions)
+        self.assertTrue(positions)
+        self.assertLess(positions[0][1], positions[0][3])

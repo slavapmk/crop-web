@@ -33,9 +33,13 @@ class ModeTests(unittest.TestCase):
                 'smoking': {'model': 'model.onnx', 'enabled': True}}
         data.update(overrides)
         Path('config.yaml').write_text(yaml.safe_dump(data), encoding='utf-8')
+        def smoking_result(*args, positions=None, **kwargs):
+            if positions is not None:
+                positions.append((1.5, 100., 80., 110., 90.))
+            return [(1., 2.)]
         with patch.object(cli, 'detect_webcam', return_value={'x': 0, 'y': 0, 'width': 264, 'height': 168}) as detect, \
              patch.object(cli, 'analyze_video', return_value=([(0., 3.), (4., 8.)], 10.)) as analysis, \
-             patch.object(cli, 'detect_smoking', return_value=[(1., 2.)]) as smoking, \
+             patch.object(cli, 'detect_smoking', side_effect=smoking_result) as smoking, \
              patch.object(cli, 'render_episodes') as episodes, \
              patch.object(cli, 'render_video') as joined, \
              contextlib.redirect_stderr(io.StringIO()):
@@ -52,14 +56,15 @@ class ModeTests(unittest.TestCase):
         smoking.assert_called_once()
         episodes.assert_called_once()
         self.assertEqual(episodes.call_args.args[3], [(0., 3.), (4., 8.)])
-        self.assertEqual(episodes.call_args.kwargs['blur_intervals'], [(1., 2.)])
+        self.assertEqual(len(episodes.call_args.kwargs['blur_regions']), 1)
+        self.assertEqual(episodes.call_args.kwargs['blur_regions'][0][2:], (94, 74, 22, 22))
         joined.assert_not_called()
 
     def test_smoking_cut_mode_removes_events_instead_of_blurring(self):
         overrides = {'smoking': {'model': 'model.onnx', 'enabled': True, 'blur': False}}
         _, _, _, episodes, _ = self.run_modules(overrides)
         self.assertEqual(episodes.call_args.args[3], [(0., 1.), (2., 3.), (4., 8.)])
-        self.assertEqual(episodes.call_args.kwargs['blur_intervals'], [])
+        self.assertEqual(episodes.call_args.kwargs['blur_regions'], [])
 
     def test_blur_works_with_concatenated_output(self):
         overrides = {'smoking': {'model': 'model.onnx', 'enabled': True, 'blur': True},
@@ -67,7 +72,7 @@ class ModeTests(unittest.TestCase):
         _, _, _, episodes, joined = self.run_modules(overrides)
         episodes.assert_not_called()
         self.assertEqual(joined.call_args.args[2], [(0., 3.), (4., 8.)])
-        self.assertEqual(joined.call_args.kwargs['blur_intervals'], [(1., 2.)])
+        self.assertEqual(len(joined.call_args.kwargs['blur_regions']), 1)
 
     def test_modules_can_be_switched_independently(self):
         overrides = {'webcam': {'auto': False, 'x': 0, 'y': 0, 'width': 264, 'height': 168},
@@ -137,13 +142,40 @@ class ModeTests(unittest.TestCase):
         self.assertNotEqual(old, current)
         cache = cli._smoking_cache_path(out, source)
         cli._save_analysis_cache(cache, old, [(1., 2.)], 3.)
+        position_cache = cache.with_name(cache.stem + '_positions.json')
+        position_signature = cli._smoking_positions_signature(current, cfg)
+        cli._save_json_cache(position_cache, {'signature': position_signature,
+                                             'positions': [(1.5, 20., 20., 30., 30.)]})
         with patch.object(cli, 'analyze_video', side_effect=AssertionError('analysis should be cached')), \
              patch.object(cli, 'detect_smoking', side_effect=AssertionError('smoking should be cached')), \
              patch.object(cli, 'render_video') as render, \
              contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             cli.main()
-        self.assertEqual(render.call_args.kwargs['blur_intervals'], [(1., 2.)])
+        self.assertEqual(len(render.call_args.kwargs['blur_regions']), 1)
         self.assertEqual(cli._load_analysis_cache(cache, current), ([(1., 2.)], 3.))
+
+    def test_cached_events_without_positions_are_localized(self):
+        data = {'webcam': {'auto': False}, 'aspect': {'enabled': False},
+                'output': {'split_episodes': False}, 'smoking': {'model': 'model.onnx'}}
+        Path('config.yaml').write_text(yaml.safe_dump(data), encoding='utf8')
+        cfg = cli.load_config(Path('config.yaml'))
+        source, out = Path('input/sample.mp4').resolve(), Path('output').resolve()
+        signature = cli._analysis_signature(source, cfg)
+        cli._save_analysis_cache(cli._analysis_cache_path(out, source), signature, [(0., 3.)], 3.)
+        smoking_signature = cli._smoking_signature(signature, cfg, Path('model.onnx').resolve())
+        cache = cli._smoking_cache_path(out, source)
+        cli._save_analysis_cache(cache, smoking_signature, [(1., 2.)], 3.)
+        def locate(*args, positions=None, **kwargs):
+            positions.append((1.5, 20., 20., 30., 30.))
+            return []
+        with patch.object(cli, 'detect_smoking', side_effect=locate) as detector, \
+             patch.object(cli, 'render_video') as render, \
+             contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            cli.main()
+            cli.main()
+        self.assertEqual(detector.call_count, 1)
+        self.assertEqual(detector.call_args.args[1], [(1., 2.)])
+        self.assertTrue(render.call_args.kwargs['blur_regions'])
 
     def test_source_directory_and_disabled_smoking(self):
         cfg = {'paths': {'source': 'input'}, 'webcam': {'auto': False}, 'output': {'split_episodes': False},

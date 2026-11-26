@@ -25,6 +25,7 @@ from clipweb.webcam import detect_webcam
 from clipweb.episodes import render_episodes
 from clipweb.aspect import crop_to_aspect
 from clipweb.progress import SUMMARY_BAR_FORMAT, STAGE_BAR_FORMAT
+from clipweb.smoking_regions import Detection, Region, build_blur_regions, map_regions, select_smoking_box
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
@@ -88,7 +89,8 @@ def load_config(path: Path) -> dict:
                     "min_hits": 2, "max_gap_seconds": 2.5,
                     "padding_before_seconds": 1.0, "padding_after_seconds": 2.0,
                     "merge_gap_seconds": 4.0, "threads": 2, "backend": "auto", "device_id": 0,
-                    "blur": True, "blur_sigma": 15.0},
+                    "blur": True, "blur_sigma": 15.0, "blur_near_mouth": True,
+                    "blur_margin_pixels": 6, "blur_hold_seconds": .35},
         "output": {"video_codec": "libx264", "preset": "veryfast", "crf": 23,
                    "audio_codec": "aac", "audio_bitrate": "160k", "join_gap_seconds": 0.0,
                    "min_segment_seconds": 0.0, "split_episodes": True},
@@ -102,7 +104,8 @@ def load_config(path: Path) -> dict:
     if float(config["face"]["missing_tolerance_seconds"]) < 0:
         raise ValueError("face.missing_tolerance_seconds must be nonnegative")
     for section, key in (("webcam", "enabled"), ("webcam", "auto"), ("face", "enabled"), ("speech", "enabled"),
-                         ("speech", "invert"), ("smoking", "enabled"), ("smoking", "blur"), ("aspect", "enabled"),
+                         ("speech", "invert"), ("smoking", "enabled"), ("smoking", "blur"),
+                         ("smoking", "blur_near_mouth"), ("aspect", "enabled"),
                          ("mute", "enabled"),
                          ("output", "split_episodes"), ("processing", "reanalyze")):
         if not isinstance(config[section][key], bool):
@@ -114,6 +117,10 @@ def load_config(path: Path) -> dict:
         raise ValueError("output.min_segment_seconds must be nonnegative")
     if not 0 < float(config["smoking"]["blur_sigma"]) <= 1024:
         raise ValueError("smoking.blur_sigma must be greater than zero and at most 1024")
+    if int(config["smoking"]["blur_margin_pixels"]) < 0:
+        raise ValueError("smoking.blur_margin_pixels must be nonnegative")
+    if float(config["smoking"]["blur_hold_seconds"]) <= 0:
+        raise ValueError("smoking.blur_hold_seconds must be greater than zero")
     return config
 
 
@@ -483,8 +490,11 @@ def _load_analysis_cache(cache_path: Path, signature: str) -> tuple[list[tuple[f
 
 def _save_analysis_cache(cache_path: Path, signature: str,
                          intervals: list[tuple[float, float]], duration: float) -> None:
+    _save_json_cache(cache_path, {"signature": signature, "duration": duration, "intervals": intervals})
+
+
+def _save_json_cache(cache_path: Path, data: dict) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    data = {"signature": signature, "duration": duration, "intervals": intervals}
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=cache_path.parent,
@@ -502,10 +512,30 @@ def _smoking_cache_path(output_dir: Path, source: Path) -> Path:
     return output_dir / ".clipweb_cache" / f"{identity}_smoking.json"
 
 
+def _smoking_positions_signature(smoking_signature: str, cfg: dict) -> str:
+    data = {"detection": smoking_signature, "version": 1,
+            "near_mouth": cfg["smoking"]["blur_near_mouth"]}
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def _load_smoking_positions(path: Path, signature: str) -> list[Detection] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("signature") != signature:
+            return None
+        positions = [tuple(map(float, item)) for item in data["positions"]]
+        if any(len(item) != 5 or not all(math.isfinite(value) for value in item)
+               or item[0] < 0 or item[3] <= item[1] or item[4] <= item[2] for item in positions):
+            return None
+        return positions
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _smoking_signature(base_signature: str, cfg: dict, model_path: Path, *, normalize_model: bool = True) -> str:
     stat = model_path.stat()
     detection_settings = {key: value for key, value in cfg["smoking"].items()
-                          if key not in {"blur", "blur_sigma"}}
+                          if not key.startswith("blur")}
     if normalize_model:
         detection_settings["model"] = str(model_path.resolve())
     data = {"base": base_signature, "smoking": detection_settings,
@@ -584,7 +614,8 @@ def _sample_video_frames(video, stream, sample_times, linear_gap: float = 2.0):
 
 
 def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict,
-                   model_path: Path, logger: logging.Logger, progress: FileProgress | None = None) -> list[tuple[float, float]]:
+                   model_path: Path, logger: logging.Logger, progress: FileProgress | None = None,
+                   positions: list[Detection] | None = None) -> list[tuple[float, float]]:
     """Find smoking events only inside already-retained face/silent ranges."""
     s = cfg["smoking"]
 
@@ -601,6 +632,7 @@ def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict
         return []
 
     predict = _smoking_predictor(model_path, s, logger)
+    face_detector = _face_detector() if positions is not None and s["blur_near_mouth"] else None
     video = av.open(str(source))
     stream = video.streams.video[0]
     box = cfg["webcam"]
@@ -632,6 +664,15 @@ def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict
                             confidence = float(np.max(prediction[:, 4:]))
                             if confidence >= float(s["confidence"]):
                                 hits.append(timestamp)
+                                if positions is not None:
+                                    faces = (face_detector.detectMultiScale(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
+                                             scaleFactor=1.12, minNeighbors=4, minSize=(40, 40))
+                                             if face_detector is not None else ())
+                                    candidate = select_smoking_box(prediction[np.newaxis, ...], cw, ch, scale,
+                                                                   left, top, float(s["confidence"]),
+                                                                   faces, bool(s["blur_near_mouth"]))
+                                    if candidate is not None:
+                                        positions.append((timestamp, *candidate))
             bar.update(1)
             bar.set_postfix(hits=len(hits), elapsed=f"{sample_time/60:.1f}m")
     video.close()
@@ -669,27 +710,19 @@ def subtract_intervals(base: list[tuple[float, float]], removals: list[tuple[flo
     return [(start, end) for start, end in result if end > start]
 
 
+def _intersect_intervals(base: list[tuple[float, float]], events: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    overlaps = [(max(a, x), min(b, y)) for a, b in base for x, y in events
+                if max(a, x) < min(b, y)]
+    return merge_intervals(sorted(overlaps), 0.0)
+
+
 def filter_short_intervals(intervals: list[tuple[float, float]], minimum: float) -> list[tuple[float, float]]:
     return [(start, end) for start, end in intervals if end - start + 1e-9 >= minimum]
 
 
-def _map_blur_intervals(intervals: list[tuple[float, float]],
-                        events: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Translate source-time smoking events to the concatenated output timeline."""
-    mapped = []
-    offset = 0.0
-    for start, end in intervals:
-        for event_start, event_end in events:
-            overlap_start, overlap_end = max(start, event_start), min(end, event_end)
-            if overlap_start < overlap_end:
-                mapped.append((offset + overlap_start - start, offset + overlap_end - start))
-        offset += end - start
-    return merge_intervals(sorted(mapped), 0.0)
-
-
 def render_video(source: Path, target: Path, intervals: list[tuple[float, float]], cfg: dict,
                  logger: logging.Logger, progress: FileProgress | None = None, show_progress: bool = True,
-                 blur_intervals: list[tuple[float, float]] | None = None) -> None:
+                 blur_regions: list[Region] | None = None) -> None:
     if not intervals:
         logger.warning("No suitable fragments: %s", source.name)
         return
@@ -711,25 +744,34 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
             for start, end in intervals:
                 stream.write(f"file '{source_name}'\ninpoint {start:.6f}\noutpoint {end:.6f}\n")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-copyts",
-               "-f", "concat", "-safe", "0", "-segment_time_metadata", "1", "-i", str(manifest_path),
-               "-map", "0:v:0"]
+               "-f", "concat", "-safe", "0", "-segment_time_metadata", "1", "-i", str(manifest_path)]
         box = cfg["webcam"]
         crop = f"crop={int(box['width'])}:{int(box['height'])}:{int(box['x'])}:{int(box['y'])}"
         video_filter = f"select=concatdec_select,{crop}"
-        mapped_blur = _map_blur_intervals(intervals, blur_intervals or [])
+        mapped_blur = map_regions(intervals, blur_regions or [])
         if mapped_blur:
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n",
                                              prefix="cw_blur_", suffix=".txt", delete=False) as commands:
                 blur_path = Path(commands.name)
-                for start, end in mapped_blur:
-                    commands.write(f"{start:.6f} gblur@smoke enable 1;\n{end:.6f} gblur@smoke enable 0;\n")
+                for start, end, x, y, width, height in mapped_blur:
+                    commands.write(f"{start:.6f} drawbox@smokemask x {x}, drawbox@smokemask y {y}, "
+                                   f"drawbox@smokemask w {width}, drawbox@smokemask h {height}, "
+                                   "drawbox@smokemask enable 1;\n")
+                    commands.write(f"{end:.6f} drawbox@smokemask enable 0;\n")
             # FFmpeg parses the graph and filter arguments separately; a literal
             # apostrophe therefore needs escaping through both parser levels.
             escaped_path = blur_path.as_posix().replace(":", r"\:").replace("'", "'" + "\\" * 3 + "''")
-            video_filter += (f",sendcmd=f='{escaped_path}',"
-                             f"gblur@smoke=sigma={float(cfg['smoking']['blur_sigma']):.6f}:enable=0")
-            logger.debug("Applying blur to %d smoking intervals in %s", len(mapped_blur), target.name)
-        cmd += ["-vf", video_filter, "-fps_mode", "vfr", "-c:v", out["video_codec"],
+            # A full-size mask keeps filter dimensions stable when boxes change size.
+            graph = (f"[0:v]{video_filter},split=3[clean][raw][maskin];"
+                     f"[raw]gblur=sigma={float(cfg['smoking']['blur_sigma']):.6f}[blur];"
+                     f"[maskin]lut=y=0:u=0:v=0,sendcmd=f='{escaped_path}',"
+                     "drawbox@smokemask=x=0:y=0:w=2:h=2:color=white:t=fill:enable=0,"
+                     "lut=u=val*2:v=val*2[mask];[clean][blur][mask]maskedmerge[vout]")
+            cmd += ["-filter_complex", graph, "-map", "[vout]"]
+            logger.debug("Applying local blur to %d smoking regions in %s", len(mapped_blur), target.name)
+        else:
+            cmd += ["-map", "0:v:0", "-vf", video_filter]
+        cmd += ["-fps_mode", "vfr", "-c:v", out["video_codec"],
                "-preset", out["preset"], "-crf", str(out["crf"])]
         if has_audio:
             cmd += ["-map", "0:a:0", "-af", "aselect=concatdec_select,aresample=async=1",
@@ -842,7 +884,7 @@ def main() -> None:
                 progress.update("audio", 1.0)
                 progress.update("video", 1.0)
                 intervals = merge_intervals(intervals, float(file_cfg["output"]["join_gap_seconds"]))
-                blur_intervals: list[tuple[float, float]] = []
+                blur_regions: list[Region] = []
                 if file_cfg["smoking"]["enabled"]:
                     model_path = Path(file_cfg["smoking"]["model"])
                     if not model_path.is_absolute():
@@ -859,14 +901,37 @@ def main() -> None:
                             if cached_smoking is not None:
                                 _save_analysis_cache(smoking_cache, smoking_signature, *cached_smoking)
                     if cached_smoking is None:
-                        smoking_events = detect_smoking(source, intervals, file_cfg, model_path, logger, progress)
+                        positions: list[Detection] | None = [] if file_cfg["smoking"]["blur"] else None
+                        smoking_events = detect_smoking(source, intervals, file_cfg, model_path, logger, progress,
+                                                        positions=positions)
                         _save_analysis_cache(smoking_cache, smoking_signature, smoking_events, duration)
                     else:
                         smoking_events, _ = cached_smoking
+                        positions = None
                         logger.info("Using cached smoking analysis for %s", source.name)
                     if file_cfg["smoking"]["blur"]:
-                        blur_intervals = smoking_events
-                        logger.info("Smoking mode: blur webcam during %d detected events", len(smoking_events))
+                        position_cache = smoking_cache.with_name(smoking_cache.stem + "_positions.json")
+                        position_signature = _smoking_positions_signature(smoking_signature, file_cfg)
+                        if positions is None and not file_cfg["processing"]["reanalyze"]:
+                            positions = _load_smoking_positions(position_cache, position_signature)
+                            if positions is not None:
+                                logger.info("Using cached smoking-object positions for %s", source.name)
+                        if positions is None:
+                            positions = []
+                            search_intervals = _intersect_intervals(intervals, smoking_events)
+                            if search_intervals:
+                                logger.info("Locating objects within %d cached smoking intervals", len(search_intervals))
+                                detect_smoking(source, search_intervals, file_cfg, model_path, logger, progress,
+                                               positions=positions)
+                        _save_json_cache(position_cache, {"signature": position_signature, "positions": positions})
+                        box = file_cfg["webcam"]
+                        blur_regions, missing = build_blur_regions(
+                            smoking_events, positions, int(box["width"]), int(box["height"]),
+                            int(file_cfg["smoking"]["blur_margin_pixels"]),
+                            float(file_cfg["smoking"]["blur_hold_seconds"]))
+                        logger.info("Smoking mode: %d local blur regions from %d detections", len(blur_regions), len(positions))
+                        if missing:
+                            logger.warning("No confirmed object position in %d smoking events; those events are not blurred", missing)
                     else:
                         intervals = subtract_intervals(intervals, smoking_events)
                         logger.info("Selected after smoking filter: %.1f%%",
@@ -882,10 +947,10 @@ def main() -> None:
                 if split:
                     episode_cache = cache_path.with_name(cache_path.stem + "_episodes.json")
                     render_episodes(source, target, episode_cache, intervals, file_cfg, logger,
-                                    render_video, progress, StageBar, blur_intervals=blur_intervals)
+                                    render_video, progress, StageBar, blur_regions=blur_regions)
                 else:
                     render_video(source, target, intervals, file_cfg, logger, progress,
-                                 blur_intervals=blur_intervals)
+                                 blur_regions=blur_regions)
                 logger.info("Finished: %s (retained %.1f%% of source duration)", target.name,
                             100 * sum(e-s for s, e in intervals) / duration if intervals else 0)
             except Exception as exc:
