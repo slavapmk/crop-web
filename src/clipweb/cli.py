@@ -20,6 +20,8 @@ import cv2
 import numpy as np
 import yaml
 from tqdm import tqdm
+
+from .cli_options import add_options, apply_overrides
 import webrtcvad
 from clipweb.webcam import detect_webcam
 from clipweb.episodes import OutputPermissionError, render_episodes
@@ -67,9 +69,11 @@ def setup_logging(cfg: dict | None = None, root: Path | None = None) -> logging.
     return logger
 
 
-def load_config(path: Path) -> dict:
+def load_config(path: Path, *, overrides=None) -> dict:
     with path.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream) or {}
+    if overrides:
+        apply_overrides(config, overrides)
     defaults = {
         "webcam": {"enabled": True, "auto": True, "samples": 24,
                    "x": 976, "y": 540, "width": 304, "height": 180},
@@ -836,11 +840,11 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
             blur_path.unlink(missing_ok=True)
 
 
-def main(config_path: Path = Path("config.yaml"), *, source: Path | None = None) -> None:
+def main(config_path: Path = Path("config.yaml"), *, source: Path | None = None, overrides=None) -> None:
     logger = setup_logging()
     try:
         config_path = config_path.resolve()
-        cfg = load_config(config_path)
+        cfg = load_config(config_path, overrides=overrides) if overrides else load_config(config_path)
         root = config_path.parent
         logger = setup_logging(cfg, root)
         logger.debug("Loaded configuration from %s", config_path)
@@ -1001,11 +1005,12 @@ def cli(argv=None):
     """Parse command-line arguments and run the selected job."""
     import argparse
 
-    parser = argparse.ArgumentParser(prog="clipweb")
+    parser = argparse.ArgumentParser(allow_abbrev=False, prog="clipweb")
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
     parser.add_argument("--source", type=Path, help="Process only this video")
-    args = parser.parse_args(argv)
-    return main(args.config, source=args.source)
+    add_options(parser)
+    args = vars(parser.parse_args(argv))
+    return main(args.pop("config"), source=args.pop("source"), overrides=args)
 
 if __name__ == "__main__":
     cli()

@@ -58,10 +58,12 @@ class ModeTests(unittest.TestCase):
         )
         with patch.object(cli, "analyze_video", return_value=([(0., 90.)], 90.)) as analysis, \
              patch.object(cli, "render_episodes") as episodes:
-            cli.cli(["--config", "job.yaml", "--source", str(selected)])
+            cli.cli(["--config", "job.yaml", "--source", str(selected),
+                     "--output", "override-output", "--no-aspect-enabled"])
         analysis.assert_called_once()
         self.assertEqual(analysis.call_args.args[0], selected)
-        self.assertEqual(episodes.call_args.args[1], self.root / "job-output" / "previous")
+        self.assertFalse(analysis.call_args.args[1]["aspect"]["enabled"])
+        self.assertEqual(episodes.call_args.args[1], self.root / "override-output" / "previous")
 
     def test_default_modules_are_independent(self):
         detect, analysis, smoking, episodes, joined = self.run_modules({})

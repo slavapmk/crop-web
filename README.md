@@ -68,3 +68,76 @@ Pass the command as an argument list to `subprocess.run` with
 in separate processes. Use distinct output directories for jobs whose paths
 could collide, and wait for each input's prior stage to finish before starting
 its next stage.
+
+## CLI arguments
+
+Example from the project directory
+
+```powershell
+uv run clipweb --source recording.mp4 --output out/job42 --no-webcam-auto --webcam-x 976 --webcam-y 540 --webcam-width 304 --webcam-height 180 --no-output-split-episodes
+```
+
+`--config PATH` selects a YAML file (default `config.yaml`). `--source PATH` selects one video. `--help` lists options. The flags below override only the corresponding YAML values, before validation. Omitted flags keep the YAML values. The values in the last column come from the example configuration.
+
+Boolean flags accept the positive and `--no-…` forms without a value. Pass a YAML list as one argument, for example `--paths-extensions '[".mp4", ".mkv"]'` where that flag is available. Use the literal `null` for optional values that should be cleared. For list items beginning with a dash, use the equals form, such as `--export-extra-args='["-movflags", "+faststart"]'` in film-reframe.
+
+`--input` and `--output` are aliases for `--paths-input` and `--paths-output`.
+
+| Flag | YAML key | Value type | Meaning | Example |
+|---|---|---|---|---|
+| `--paths-input` | `paths.input` | text | Directory scanned in batch mode. | `input` |
+| `--paths-output` | `paths.output` | text | Destination directory for results and applicable caches. | `output` |
+| `--paths-source` | `paths.source` | optional text | Configured source file or directory. An explicit --source takes precedence. | `null` |
+| `--processing-reanalyze` / `--no-processing-reanalyze` | `processing.reanalyze` | boolean | Ignore saved analysis and recompute it for this job. | `false` |
+| `--webcam-enabled` / `--no-webcam-enabled` | `webcam.enabled` | boolean | Use a webcam crop. Disable to start from the full source frame. | `true` |
+| `--webcam-auto` / `--no-webcam-auto` | `webcam.auto` | boolean | Detect the webcam rectangle automatically. Disable to use the four manual coordinates. | `true` |
+| `--webcam-samples` | `webcam.samples` | integer | Number of sampled video frames used for automatic webcam detection. | `24` |
+| `--webcam-x` | `webcam.x` | integer | Left edge of the manual webcam rectangle, in source pixels. | `976` |
+| `--webcam-y` | `webcam.y` | integer | Top edge of the manual webcam rectangle, in source pixels. | `540` |
+| `--webcam-width` | `webcam.width` | integer | Width of the manual webcam rectangle, in source pixels. | `304` |
+| `--webcam-height` | `webcam.height` | integer | Height of the manual webcam rectangle, in source pixels. | `180` |
+| `--face-enabled` / `--no-face-enabled` | `face.enabled` | boolean | Filter out intervals without a detected face. | `true` |
+| `--face-missing-tolerance-seconds` | `face.missing_tolerance_seconds` | number | Bridge brief missed detections between two confirmed faces. | `5.0` |
+| `--speech-enabled` / `--no-speech-enabled` | `speech.enabled` | boolean | Apply speech filtering independently of face filtering. | `false` |
+| `--speech-method` | `speech.method` | text | both: voice and mouth motion; speech: voice only; mouth: mouth motion only. | `both` |
+| `--speech-invert` / `--no-speech-invert` | `speech.invert` | boolean | true keeps detected speech; false removes it. | `false` |
+| `--aspect-enabled` / `--no-aspect-enabled` | `aspect.enabled` | boolean | Crop the selected rectangle to the requested ratio without stretching. | `true` |
+| `--aspect-ratio` | `aspect.ratio` | text | Target aspect ratio as width:height, for example 16:10. | `'16:10'` |
+| `--mute-enabled` / `--no-mute-enabled` | `mute.enabled` | boolean | Remove audio from exports while preserving audio analysis. | `false` |
+| `--analysis-sample-fps` | `analysis.sample_fps` | number | Video samples per second for face and mouth analysis. | `5` |
+| `--analysis-audio-sample-rate` | `analysis.audio_sample_rate` | integer | Audio resampling rate in Hz used by WebRTC VAD. | `16000` |
+| `--analysis-audio-frame-ms` | `analysis.audio_frame_ms` | integer | Audio frame duration in milliseconds used by WebRTC VAD. | `30` |
+| `--analysis-vad-aggressiveness` | `analysis.vad_aggressiveness` | integer | WebRTC voice activity mode from 0 to 3. | `2` |
+| `--analysis-lip-motion-threshold` | `analysis.lip_motion_threshold` | number | Minimum change in the mouth patch used to count visual speech evidence. | `2.8` |
+| `--analysis-mouth-motion-ratio` | `analysis.mouth_motion_ratio` | number | Fraction of video samples with mouth motion required in a speech window. | `0.5` |
+| `--analysis-speech-ratio` | `analysis.speech_ratio` | number | Fraction of voiced audio frames required in a speech window. | `0.2` |
+| `--analysis-window-seconds` | `analysis.window_seconds` | number | Duration in seconds of the speech classification window. | `0.6` |
+| `--analysis-speech-padding-seconds` | `analysis.speech_padding_seconds` | number | Seconds added around detected speech intervals. | `0.35` |
+| `--smoking-enabled` / `--no-smoking-enabled` | `smoking.enabled` | boolean | Enable smoking object analysis and filtering. | `true` |
+| `--smoking-blur` / `--no-smoking-blur` | `smoking.blur` | boolean | true blurs detected object regions; false cuts smoking intervals. | `true` |
+| `--smoking-blur-sigma` | `smoking.blur_sigma` | number | Gaussian blur strength for detected regions, in pixels. | `15.0` |
+| `--smoking-blur-near-mouth` / `--no-smoking-blur-near-mouth` | `smoking.blur_near_mouth` | boolean | More conservative: only blur detections near a detected mouth. | `true` |
+| `--smoking-blur-margin-pixels` | `smoking.blur_margin_pixels` | integer | Extra pixels included around a detected object in the blur region. | `6` |
+| `--smoking-blur-hold-seconds` | `smoking.blur_hold_seconds` | number | Maximum time on either side of a confirmed detection. | `0.35` |
+| `--smoking-model` | `smoking.model` | text | Path to the smoking detector ONNX model. | `models/smoking_detector.onnx` |
+| `--smoking-backend` | `smoking.backend` | text | Inference backend selected for the smoking detector. | `auto` |
+| `--smoking-device-id` | `smoking.device_id` | integer | GPU index for DirectML inference. | `0` |
+| `--smoking-sample-fps` | `smoking.sample_fps` | number | Smoking detection samples per second. | `2.0` |
+| `--smoking-input-size` | `smoking.input_size` | integer | Detector input width and height in pixels. | `640` |
+| `--smoking-confidence` | `smoking.confidence` | number | Minimum model confidence for a detection. | `0.35` |
+| `--smoking-min-hits` | `smoking.min_hits` | integer | Minimum number of detections required in an event. | `2` |
+| `--smoking-max-gap-seconds` | `smoking.max_gap_seconds` | number | Maximum time between hits in one smoking event. | `2.5` |
+| `--smoking-padding-before-seconds` | `smoking.padding_before_seconds` | number | Seconds added before a detected smoking event. | `1.0` |
+| `--smoking-padding-after-seconds` | `smoking.padding_after_seconds` | number | Seconds added after a detected smoking event. | `2.0` |
+| `--smoking-merge-gap-seconds` | `smoking.merge_gap_seconds` | number | Merge smoking events that are separated by at most this many seconds. | `4.0` |
+| `--smoking-threads` | `smoking.threads` | integer | CPU inference thread count for the detector. | `2` |
+| `--output-split-episodes` / `--no-output-split-episodes` | `output.split_episodes` | boolean | true: separate numbered episodes; false: one concatenated video. | `true` |
+| `--output-video-codec` | `output.video_codec` | text | Video encoder used for rendered output. | `libx264` |
+| `--output-preset` | `output.preset` | text | Video encoder speed and compression preset. | `veryfast` |
+| `--output-crf` | `output.crf` | integer | Constant rate factor used for video quality. | `23` |
+| `--output-audio-codec` | `output.audio_codec` | text | Audio encoder used for rendered output. | `aac` |
+| `--output-audio-bitrate` | `output.audio_bitrate` | text | Target audio bitrate such as 160k. | `160k` |
+| `--output-join-gap-seconds` | `output.join_gap_seconds` | number | Joining gaps can include previously filtered audio/video. | `0.0` |
+| `--output-min-segment-seconds` | `output.min_segment_seconds` | number | Discard episodes shorter than one minute; 0 keeps all non-empty episodes. | `60.0` |
+| `--logging-console-level` | `logging.console_level` | text | Minimum severity written to the console. | `INFO` |
+| `--logging-file-level` | `logging.file_level` | text | Minimum severity written to the run log. | `DEBUG` |
