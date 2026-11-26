@@ -226,8 +226,8 @@ class FileProgress:
             value = sum(self.stages.values()) / len(self.stages)
             delta = value - self.value
             self.value = value
-            self.bar.update(delta * 100)
-            self.overall.update(delta)
+            self.bar.update(min(delta * 100, max(0.0, self.bar.total - self.bar.n)))
+            self.overall.update(min(delta, max(0.0, self.overall.total - self.overall.n)))
             if now - self.last_eta >= 1 or value >= 1:
                 remaining = self.eta.remaining(self.stages, now)
                 if remaining is None:

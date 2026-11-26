@@ -42,3 +42,15 @@ class ProgressTests(unittest.TestCase):
             self.assertAlmostEqual(overall.n, 1)
             self.assertAlmostEqual(progress.bar.n, 100)
             progress.close()
+
+    def test_fractional_updates_never_exceed_total(self):
+        overall = FakeBar()
+        with patch('clipweb.cli.tqdm', FakeBar):
+            progress = FileProgress(overall, ('audio', 'video', 'smoking', 'render'))
+            for stage in progress.stages:
+                for i in range(1, 302):
+                    progress.update(stage, i / 301)
+                    self.assertLessEqual(progress.bar.n, progress.bar.total)
+                    self.assertLessEqual(overall.n, overall.total)
+            self.assertAlmostEqual(progress.bar.n, 100)
+            self.assertAlmostEqual(overall.n, 1)

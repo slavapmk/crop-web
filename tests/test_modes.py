@@ -128,6 +128,20 @@ class ModeTests(unittest.TestCase):
             cli.main()
         self.assertEqual(result.exception.code, 1)
 
+    def test_empty_project_initializes_directories_idempotently(self):
+        Path('input/sample.mp4').unlink()
+        Path('input').rmdir()
+        config = Path('config.yaml')
+        config.write_text('{}', encoding='utf-8')
+        original = config.read_bytes()
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            cli.main()
+            cli.main()
+        self.assertEqual(config.read_bytes(), original)
+        for name in ('input', 'output', 'logs'):
+            self.assertTrue(Path(name).is_dir())
+        self.assertEqual(len(list(Path('logs').glob('*.log'))), 2)
+
     def test_missing_model_reports_failure(self):
         cfg = {'webcam': {'auto': False}, 'output': {'split_episodes': False}, 'smoking': {'model': 'missing.onnx'}}
         Path('config.yaml').write_text(yaml.safe_dump(cfg), encoding='utf-8')

@@ -13,7 +13,7 @@ uv sync
 uv run clipweb
 ```
 
-Place supported videos in `input/`. The program creates `input/`, `output/`, and `logs/` as needed. Alternatively set `paths.source` in `config.yaml` to an absolute or config-relative video file or directory. All settings are in `config.yaml`; run the command from the project directory. Supported input extensions are MP4, MKV, MOV, AVI, WebM and M4V.
+Place supported videos in `input/`. The program creates `input/`, `output/`, and `logs/` as needed. The default `config.yaml` is tracked in the repository and remains after `git clean -ffdx`; the program does not recreate it if it is manually deleted. `git clean -ffdx` removes ignored files, including recordings, results, caches, logs and `.venv`. Alternatively set `paths.source` in `config.yaml` to an absolute or config-relative video file or directory. All settings are in `config.yaml`; run the command from the project directory. Supported input extensions are MP4, MKV, MOV, AVI, WebM and M4V.
 
 ## Independent processing modules
 
