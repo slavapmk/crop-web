@@ -11,7 +11,7 @@ import av
 import cv2
 import numpy as np
 
-from clipweb.cli import filter_short_intervals, load_config, render_video
+from clipweb.cli import _map_blur_intervals, filter_short_intervals, load_config, render_video
 from clipweb.episodes import render_episodes
 
 
@@ -27,6 +27,19 @@ class FragmentTests(unittest.TestCase):
         items = [(0., .2), (1., 1.5), (3., 4.)]
         self.assertEqual(filter_short_intervals(items, .5), items[1:])
         self.assertEqual(filter_short_intervals(items, 0), items)
+
+    def test_smoking_timestamps_are_mapped_across_cuts(self):
+        intervals = [(1., 2.), (4., 6.)]
+        events = [(1.2, 1.5), (4.1, 4.4), (5.5, 7.)]
+        actual = _map_blur_intervals(intervals, events)
+        expected = [(0.2, 0.5), (1.1, 1.4), (2.5, 3.)]
+        self.assertEqual(len(actual), len(expected))
+        for pair, reference in zip(actual, expected):
+            self.assertAlmostEqual(pair[0], reference[0])
+            self.assertAlmostEqual(pair[1], reference[1])
+
+    def test_overlapping_blur_events_do_not_shrink(self):
+        self.assertEqual(_map_blur_intervals([(0., 10.)], [(1., 5.), (2., 3.)]), [(1., 5.)])
 
 
 @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is required')
@@ -135,3 +148,74 @@ class RenderIntegrationTests(unittest.TestCase):
                 with av.open(str(path)) as container:
                     self.assertFalse(container.streams.audio)
                     self.assertTrue(container.streams.video)
+
+    def test_blur_is_timed_and_preserves_footage_and_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.mp4'
+            subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                            '-f', 'lavfi', '-i', 'testsrc2=size=128x96:rate=30:duration=6',
+                            '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=6',
+                            '-c:v', 'libx264', '-g', '120', '-c:a', 'aac', '-shortest', str(source)],
+                           check=True, capture_output=True)
+            config_file = root / 'config.yaml'
+            config_file.write_text('{}', encoding='utf8')
+            cfg = load_config(config_file)
+            cfg['webcam'] = dict(x=0, y=0, width=128, height=96)
+            intervals = [(.6, 1.6), (3., 5.)]
+            events = [(.9, 1.3), (3.6, 4.1)]
+            baseline, blurred = root / 'baseline.mp4', root / 'blurred.mp4'
+            logger = logging.getLogger('test')
+            render_video(source, baseline, intervals, cfg, logger, show_progress=False)
+            render_video(source, blurred, intervals, cfg, logger, show_progress=False, blur_intervals=events)
+            def image_at(container, timestamp):
+                stream = container.streams.video[0]
+                container.seek(int(timestamp / float(stream.time_base)), stream=stream, backward=True)
+                return next(frame.to_ndarray(format='bgr24') for frame in container.decode(video=0)
+                            if frame.pts is not None and float(frame.pts * frame.time_base) + 1e-6 >= timestamp)
+            with av.open(str(baseline)) as original, av.open(str(blurred)) as result:
+                self.assertTrue(result.streams.audio)
+                self.assertAlmostEqual(result.duration / av.time_base, original.duration / av.time_base, delta=.05)
+                for timestamp in (.1, .7, 1.25, 2.1, 2.4):
+                    diff = np.mean(cv2.absdiff(image_at(original, timestamp), image_at(result, timestamp)))
+                    self.assertLess(diff, 6., f'unexpected blur at {timestamp}s')
+                for timestamp in (.3, .5, 1.6, 1.8):
+                    diff = np.mean(cv2.absdiff(image_at(original, timestamp), image_at(result, timestamp)))
+                    self.assertGreater(diff, 8., f'blur missing at {timestamp}s')
+            baseline_dir, blurred_dir = root / 'split-original', root / 'split-blurred'
+            render_episodes(source, baseline_dir, root / 'cache' / 'original.json', intervals,
+                            cfg, logger, render_video, None, QuietBar)
+            render_episodes(source, blurred_dir, root / 'cache' / 'blurred.json', intervals,
+                            cfg, logger, render_video, None, QuietBar, blur_intervals=events)
+            for index, name in enumerate(('18-47.mp4', '90-149.mp4')):
+                with av.open(str(baseline_dir / name)) as original, av.open(str(blurred_dir / name)) as result:
+                    self.assertTrue(result.streams.audio)
+                    outside, inside = (.1, .5) if index == 0 else (.2, .8)
+                    self.assertLess(np.mean(cv2.absdiff(image_at(original, outside), image_at(result, outside))), 6.)
+                    self.assertGreater(np.mean(cv2.absdiff(image_at(original, inside), image_at(result, inside))), 8.)
+            boundary = root / 'boundary.mp4'
+            render_video(source, boundary, [intervals[0]], cfg, logger, show_progress=False,
+                         blur_intervals=[(0., 1.1)])
+            with av.open(str(baseline)) as original, av.open(str(boundary)) as result:
+                self.assertGreater(np.mean(cv2.absdiff(image_at(original, .1), image_at(result, .1))), 8.)
+                self.assertLess(np.mean(cv2.absdiff(image_at(original, .8), image_at(result, .8))), 6.)
+
+    def test_blur_command_file_handles_special_characters_in_temp_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command_dir = root / "temp's folder,part"
+            command_dir.mkdir()
+            source, output = root / 'source.mp4', root / 'blurred.mp4'
+            subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=128x96:rate=10:duration=2', '-c:v', 'libx264',
+                            str(source)], check=True, capture_output=True)
+            config_file = root / 'config.yaml'
+            config_file.write_text('{}', encoding='utf8')
+            cfg = load_config(config_file)
+            cfg['webcam'] = dict(x=0, y=0, width=128, height=96)
+            with patch('tempfile.tempdir', str(command_dir)):
+                render_video(source, output, [(0., 2.)], cfg, logging.getLogger('test'),
+                             show_progress=False, blur_intervals=[(.5, 1.5)])
+            with av.open(str(output)) as container:
+                self.assertTrue(container.streams.video)
+            self.assertFalse(list(command_dir.glob('cw_blur_*.txt')))

@@ -51,8 +51,23 @@ class ModeTests(unittest.TestCase):
         self.assertEqual((used_cfg['webcam']['width'], used_cfg['webcam']['height']), (256, 160))
         smoking.assert_called_once()
         episodes.assert_called_once()
-        self.assertEqual(episodes.call_args.args[3], [(0., 1.), (2., 3.), (4., 8.)])
+        self.assertEqual(episodes.call_args.args[3], [(0., 3.), (4., 8.)])
+        self.assertEqual(episodes.call_args.kwargs['blur_intervals'], [(1., 2.)])
         joined.assert_not_called()
+
+    def test_smoking_cut_mode_removes_events_instead_of_blurring(self):
+        overrides = {'smoking': {'model': 'model.onnx', 'enabled': True, 'blur': False}}
+        _, _, _, episodes, _ = self.run_modules(overrides)
+        self.assertEqual(episodes.call_args.args[3], [(0., 1.), (2., 3.), (4., 8.)])
+        self.assertEqual(episodes.call_args.kwargs['blur_intervals'], [])
+
+    def test_blur_works_with_concatenated_output(self):
+        overrides = {'smoking': {'model': 'model.onnx', 'enabled': True, 'blur': True},
+                     'output': {'split_episodes': False}}
+        _, _, _, episodes, joined = self.run_modules(overrides)
+        episodes.assert_not_called()
+        self.assertEqual(joined.call_args.args[2], [(0., 3.), (4., 8.)])
+        self.assertEqual(joined.call_args.kwargs['blur_intervals'], [(1., 2.)])
 
     def test_modules_can_be_switched_independently(self):
         overrides = {'webcam': {'auto': False, 'x': 0, 'y': 0, 'width': 264, 'height': 168},
@@ -106,6 +121,29 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(analysis.call_count, 1)
         self.assertEqual(smoking.call_count, 1)
         self.assertEqual(render.call_count, 2)
+
+    def test_existing_relative_model_cache_is_migrated(self):
+        data = {'webcam': {'auto': False}, 'aspect': {'enabled': False},
+                'output': {'split_episodes': False}, 'smoking': {'model': 'model.onnx'}}
+        Path('config.yaml').write_text(yaml.safe_dump(data), encoding='utf8')
+        cfg = cli.load_config(Path('config.yaml'))
+        source = Path('input/sample.mp4').resolve()
+        model = Path('model.onnx').resolve()
+        out = Path('output').resolve()
+        signature = cli._analysis_signature(source, cfg)
+        cli._save_analysis_cache(cli._analysis_cache_path(out, source), signature, [(0., 3.)], 3.)
+        old = cli._smoking_signature(signature, cfg, model, normalize_model=False)
+        current = cli._smoking_signature(signature, cfg, model)
+        self.assertNotEqual(old, current)
+        cache = cli._smoking_cache_path(out, source)
+        cli._save_analysis_cache(cache, old, [(1., 2.)], 3.)
+        with patch.object(cli, 'analyze_video', side_effect=AssertionError('analysis should be cached')), \
+             patch.object(cli, 'detect_smoking', side_effect=AssertionError('smoking should be cached')), \
+             patch.object(cli, 'render_video') as render, \
+             contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            cli.main()
+        self.assertEqual(render.call_args.kwargs['blur_intervals'], [(1., 2.)])
+        self.assertEqual(cli._load_analysis_cache(cache, current), ([(1., 2.)], 3.))
 
     def test_source_directory_and_disabled_smoking(self):
         cfg = {'paths': {'source': 'input'}, 'webcam': {'auto': False}, 'output': {'split_episodes': False},

@@ -35,6 +35,11 @@ class CacheAndDetectorTests(unittest.TestCase):
     def test_smoking_signature_changes_when_model_or_settings_change(self):
         model = self.root / 'model'; model.write_bytes(b'model')
         old = cli._smoking_signature('base', self.cfg, model)
+        self.cfg['smoking']['blur'] = not self.cfg['smoking']['blur']
+        self.cfg['smoking']['blur_sigma'] = 30
+        self.assertEqual(old, cli._smoking_signature('base', self.cfg, model))
+        self.cfg['smoking']['model'] = str(model.resolve())
+        self.assertEqual(old, cli._smoking_signature('base', self.cfg, model))
         self.cfg['smoking']['confidence'] = .8
         self.assertNotEqual(old, cli._smoking_signature('base', self.cfg, model))
 
@@ -63,6 +68,7 @@ class CacheAndDetectorTests(unittest.TestCase):
         for text in ('face: {enabled: wrong}', 'analysis: {speech_ratio: 0}',
                      'speech: {method: bad}',
                      'output: {min_segment_seconds: -1}', 'output: {split_episodes: maybe}', 'mute: {enabled: maybe}',
+                     'smoking: {blur: maybe}', 'smoking: {blur_sigma: 0}',
                      'face: {missing_tolerance_seconds: -1}'):
             path = self.root / 'bad.yaml'; path.write_text(text, encoding='utf8')
             with self.subTest(text=text), self.assertRaises(ValueError): cli.load_config(path)

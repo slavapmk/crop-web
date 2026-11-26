@@ -53,9 +53,12 @@ analysis:
   window_seconds: 0.6
   speech_padding_seconds: 0.35
 
-# Remove probable smoking independently from face and speech filtering.
+# Detect probable smoking independently from face and speech filtering.
 smoking:
   enabled: true
+  # true blurs the webcam during smoking; false cuts smoking intervals.
+  blur: true
+  blur_sigma: 15.0
   model: models/smoking_detector.onnx
   backend: auto
   device_id: 0

@@ -73,7 +73,8 @@ def index_intervals(source: Path, intervals: list[tuple[float, float]]) -> list[
 
 
 def render_episodes(source: Path, folder: Path, cache_path: Path, intervals: list[tuple[float, float]],
-                    cfg: dict, logger: logging.Logger, render, progress, stage_bar) -> None:
+                    cfg: dict, logger: logging.Logger, render, progress, stage_bar,
+                    blur_intervals: list[tuple[float, float]] | None = None) -> None:
     episodes = index_intervals(source, intervals)
     folder.mkdir(parents=True, exist_ok=True)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,7 +103,11 @@ def render_episodes(source: Path, folder: Path, cache_path: Path, intervals: lis
             os.close(fd)
             temp_path = Path(temporary)
             try:
-                render(source, temp_path, [(start, end)], cfg, logger, show_progress=False)
+                if blur_intervals:
+                    render(source, temp_path, [(start, end)], cfg, logger,
+                           show_progress=False, blur_intervals=blur_intervals)
+                else:
+                    render(source, temp_path, [(start, end)], cfg, logger, show_progress=False)
                 os.replace(temp_path, folder / name)
             finally:
                 temp_path.unlink(missing_ok=True)
