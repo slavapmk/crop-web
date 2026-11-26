@@ -22,3 +22,11 @@ uv run clipweb
 ## Ограничения
 
 Детектор лица и оценка движения рта эвристические. Жевание, повороты головы, слабый свет, маленькое лицо или играющая речь могут давать ошибки; пороги можно настроить. Это не распознавание личности и не точная фонемная синхронизация. Проверяйте выбранные режимы на нескольких коротких отрезках исходной записи перед обработкой длинного стрима. Целевая скорость зависит от исходного кодека и числа ядер; замер на рабочем CPU обязателен.
+
+## Diagnostic coverage
+
+The analysis log reports the percentage of samples with a detected face, voice activity, mouth motion and speech cuts, followed by the duration retained before and after smoking removal. Low face coverage may indicate an incorrect webcam rectangle or an unreliable face detector. The analysis cache is invalidated automatically after the sampling fix.
+
+`analysis.speech_detection: both` combines mouth motion with voice activity; `mouth` uses motion alone. Neither reliably distinguishes speech from eating, drinking, yawning or background voices. Smoking detection is experimental and can also produce false positives. Validate these settings on representative footage.
+
+[Русская версия](README.ru.md)

@@ -1,10 +1,7 @@
 .venv/
 __pycache__/
 *.py[cod]
-input/*
-!input/.gitkeep
-output/*
-!output/.gitkeep
+input/
+output/
 work/
-output/.clipweb_cache/
-config.toml
+logs/

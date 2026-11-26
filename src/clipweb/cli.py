@@ -61,8 +61,8 @@ def load_config(path: Path) -> dict:
         config.setdefault(section, {})
         for key, value in values.items():
             config[section].setdefault(key, value)
-    if config["analysis"]["speech_detection"] not in {"face", "speech", "both"}:
-        raise ValueError("analysis.speech_detection must be face, speech, or both")
+    if config["analysis"]["speech_detection"] not in {"face", "speech", "both", "mouth"}:
+        raise ValueError("analysis.speech_detection must be face, speech, both, or mouth")
     return config
 
 
@@ -89,6 +89,10 @@ def _mouth_motion(current: np.ndarray, previous: np.ndarray | None) -> float:
     return float(np.mean(cv2.absdiff(current, previous)))
 
 
+def _sample_index(timestamp: float, step: float, frame_count: int) -> int:
+    return min(frame_count - 1, max(0, int((timestamp + 1e-6) / step)))
+
+
 def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[tuple[float, float]], float]:
     a = cfg["analysis"]
     box = cfg["webcam"]
@@ -108,7 +112,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[t
     previous = None
     logger.info("Анализ: %s (%.1f мин., шаг %.2f с)", path.name, duration / 60, step)
     # Decode audio once for VAD; timestamps map voice activity back to the video timeline.
-    if audio_stream:
+    if audio_stream and a["speech_detection"] in {"speech", "both"}:
         audio_stream.thread_type = "AUTO"
         resampler = av.AudioResampler(format="s16", layout="mono", rate=int(a["audio_sample_rate"]))
         sample_rate = int(a["audio_sample_rate"])
@@ -152,7 +156,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[t
                 pending = data[complete_bytes:]
                 pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
             bar.update(max(0, int(duration) - last_audio_second))
-    else:
+    elif not audio_stream and a["speech_detection"] in {"speech", "both"}:
         logger.warning("Аудиодорожка не найдена; речь можно оценить только по движению лица")
     # Reopen after audio decode, then sample webcam frames at configured cadence.
     container.close()
@@ -164,7 +168,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[t
             timestamp = float(frame.pts * frame.time_base) if frame.pts is not None else 0.0
             if timestamp + 1e-6 < next_sample:
                 continue
-            idx = min(frame_count - 1, max(0, int((timestamp + 1e-6) / step)))
+            idx = _sample_index(timestamp, step, frame_count)
             image = frame.to_ndarray(format="bgr24")
             x, y, w, h = (int(box[k]) for k in ("x", "y", "width", "height"))
             crop = image[max(0, y):min(image.shape[0], y+h), max(0, x):min(image.shape[1], x+w)]
@@ -202,6 +206,8 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[t
     speech = vad_presence.copy()
     if a["speech_detection"] == "both":
         speech &= moving
+    elif a["speech_detection"] == "mouth":
+        speech = moving.copy()
     speech &= face_grid
     mode = a["speech_detection"]
     if mode == "face":
@@ -232,7 +238,8 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[t
                     continue
                 if mode != "face":
                     # Do not bridge over possible voice when lip evidence is unavailable.
-                    keep[s:e] = (keep[s-1] or keep[e]) & ~vad_presence[s:e]
+                    evidence = moving if mode == "mouth" else vad_presence
+                    keep[s:e] = (keep[s-1] or keep[e]) & ~evidence[s:e]
                 else:
                     keep[s:e] = keep[s-1] or keep[e]
     # Convert retained sample mask into source-time intervals; pad each edge to avoid choppy cuts.
