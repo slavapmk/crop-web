@@ -61,7 +61,8 @@ def load_config(path: Path) -> dict:
                     "padding_before_seconds": 1.0, "padding_after_seconds": 2.0,
                     "merge_gap_seconds": 4.0, "threads": 2, "backend": "auto", "device_id": 0},
         "output": {"video_codec": "libx264", "preset": "veryfast", "crf": 23,
-                   "audio_codec": "aac", "audio_bitrate": "160k", "join_gap_seconds": .25},
+                   "audio_codec": "aac", "audio_bitrate": "160k", "join_gap_seconds": .25,
+                   "min_segment_seconds": .5},
     }
     for section, values in defaults.items():
         config.setdefault(section, {})
@@ -72,6 +73,8 @@ def load_config(path: Path) -> dict:
     for name in ("speech_ratio", "mouth_motion_ratio"):
         if not 0 < float(config["analysis"][name]) <= 1:
             raise ValueError(f"analysis.{name} must be greater than zero and at most one")
+    if float(config["output"]["min_segment_seconds"]) < 0:
+        raise ValueError("output.min_segment_seconds must be nonnegative")
     return config
 
 
@@ -616,6 +619,10 @@ def subtract_intervals(base: list[tuple[float, float]], removals: list[tuple[flo
     return [(start, end) for start, end in result if end > start]
 
 
+def filter_short_intervals(intervals: list[tuple[float, float]], minimum: float) -> list[tuple[float, float]]:
+    return [(start, end) for start, end in intervals if end - start + 1e-9 >= minimum]
+
+
 def render_video(source: Path, target: Path, intervals: list[tuple[float, float]], cfg: dict, logger: logging.Logger, progress: FileProgress | None = None) -> None:
     if not intervals:
         logger.warning("Нет подходящих фрагментов: %s", source.name)
@@ -636,32 +643,41 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
             source_name = source.resolve().as_posix().replace("'", "'\\''")
             for start, end in intervals:
                 stream.write(f"file '{source_name}'\ninpoint {start:.6f}\noutpoint {end:.6f}\n")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-               "-f", "concat", "-safe", "0", "-i", str(manifest_path),
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-copyts",
+               "-f", "concat", "-safe", "0", "-segment_time_metadata", "1", "-i", str(manifest_path),
                "-map", "0:v:0"]
         box = cfg["webcam"]
         crop = f"crop={int(box['width'])}:{int(box['height'])}:{int(box['x'])}:{int(box['y'])}"
-        cmd += ["-vf", crop, "-c:v", out["video_codec"],
+        cmd += ["-vf", f"select=concatdec_select,{crop}", "-fps_mode", "vfr", "-c:v", out["video_codec"],
                "-preset", out["preset"], "-crf", str(out["crf"])]
         if has_audio:
-            cmd += ["-map", "0:a:0", "-c:a", out["audio_codec"], "-b:a", out["audio_bitrate"]]
+            cmd += ["-map", "0:a:0", "-af", "aselect=concatdec_select,aresample=async=1",
+                    "-c:a", out["audio_codec"], "-b:a", out["audio_bitrate"]]
         cmd += ["-progress", "pipe:1", str(target)]
         duration = sum(end - start for start, end in intervals)
         logger.info("Сборка %s: %.1f мин. из %d фрагментов (переходы к отрезкам)", target.name, duration/60, len(intervals))
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-        with StageBar(total=max(0.1, duration), desc="Render", unit="s", position=2, leave=False, dynamic_ncols=True, progress=progress, stage="render") as bar:
-            last = 0.0
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                if line.startswith("out_time_ms="):
-                    now = int(line.partition("=")[2] or 0) / 1_000_000
-                    bar.update(max(0.0, now-last)); last = now
-                elif line.startswith("progress=end"):
-                    bar.update(max(0.0, duration-last))
-        err = proc.stderr.read() if proc.stderr else ""
-        code = proc.wait()
-        if code:
-            raise RuntimeError(f"ffmpeg завершился с кодом {code}: {err[-2000:]}")
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errors:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, text=True, bufsize=1)
+            try:
+                with StageBar(total=max(0.1, duration), desc="Render", unit="s", position=2, leave=False, dynamic_ncols=True, progress=progress, stage="render") as bar:
+                    last = 0.0
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        if line.startswith("out_time_ms="):
+                            now = int(line.partition("=")[2] or 0) / 1_000_000
+                            bar.update(max(0.0, now-last)); last = now
+                        elif line.startswith("progress=end"):
+                            bar.update(max(0.0, duration-last))
+                code = proc.wait()
+                if code:
+                    errors.seek(0)
+                    raise RuntimeError(f"ffmpeg failed with code {code}: {errors.read()[-2000:]}")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                if proc.stdout is not None:
+                    proc.stdout.close()
     finally:
         if manifest_path is not None:
             manifest_path.unlink(missing_ok=True)
@@ -742,6 +758,10 @@ def main() -> None:
                                 100 * sum(end - start for start, end in intervals) / duration)
                     logger.info("После вырезания курения осталось фрагментов: %d", len(intervals))
                 progress.update("smoking", 1.0)
+                before = len(intervals)
+                intervals = filter_short_intervals(intervals, float(cfg["output"]["min_segment_seconds"]))
+                logger.info("Removed %d short fragments; %d remain (%.1f min)", before - len(intervals),
+                            len(intervals), sum(end - start for start, end in intervals) / 60)
                 target = output_dir / f"{source.stem}_clipweb.mp4"
                 render_video(source, target, intervals, cfg, logger, progress)
                 logger.info("Готово: %s (сохранено %.1f%% длительности)", target.name,
