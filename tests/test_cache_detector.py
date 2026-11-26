@@ -32,6 +32,12 @@ class CacheAndDetectorTests(unittest.TestCase):
         path.write_text('{bad', encoding='utf8')
         self.assertIsNone(cli._load_analysis_cache(path, signature))
 
+    def test_raw_face_cache_reuse_requires_matching_face_only_analysis(self):
+        path = cli._analysis_cache_path(self.root, self.source)
+        self.assertIsNone(cli._reuse_raw_face_cache(self.source, path, self.cfg))
+        self.cfg['face']['enabled'] = False
+        self.assertIsNone(cli._reuse_raw_face_cache(self.source, path, self.cfg))
+
     def test_smoking_signature_changes_when_model_or_settings_change(self):
         model = self.root / 'model'; model.write_bytes(b'model')
         old = cli._smoking_signature('base', self.cfg, model)

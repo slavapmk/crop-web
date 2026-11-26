@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import logging
 import os
@@ -137,6 +138,26 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(analysis.call_count, 1)
         self.assertEqual(smoking.call_count, 1)
         self.assertEqual(render.call_count, 2)
+
+    def test_cached_raw_face_analysis_is_reused_and_smoking_reanalyzed(self):
+        data = {'webcam': {'auto': False}, 'aspect': {'enabled': False},
+                'output': {'split_episodes': False, 'min_segment_seconds': 0},
+                'smoking': {'model': 'model.onnx'}}
+        Path('config.yaml').write_text(yaml.safe_dump(data), encoding='utf8')
+        cfg = cli.load_config(Path('config.yaml'))
+        source, out = Path('input/sample.mp4').resolve(), Path('output').resolve()
+        old = copy.deepcopy(cfg)
+        old['face']['missing_tolerance_seconds'] = 0.0
+        cache = cli._analysis_cache_path(out, source)
+        cli._save_analysis_cache(cache, cli._analysis_signature(source, old), [(0., 1.), (2., 3.)], 3.)
+        with patch.object(cli, 'analyze_video', side_effect=AssertionError('face cache should be reused')), \
+             patch.object(cli, 'detect_smoking', return_value=[]) as smoking, \
+             patch.object(cli, 'render_video') as render, \
+             contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            cli.main()
+        self.assertEqual(smoking.call_args.args[1], [(0., 3.)])
+        self.assertEqual(render.call_args.args[2], [(0., 3.)])
+        self.assertEqual(cli._load_analysis_cache(cache, cli._analysis_signature(source, cfg)), ([(0., 3.)], 3.))
 
     def test_existing_relative_model_cache_is_migrated(self):
         data = {'webcam': {'auto': False}, 'aspect': {'enabled': False},

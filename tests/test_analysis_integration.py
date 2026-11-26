@@ -1,4 +1,5 @@
 import logging
+import copy
 import shutil
 import subprocess
 import tempfile
@@ -96,6 +97,26 @@ class AnalysisIntegrationTests(unittest.TestCase):
         self.assertEqual(len(intervals), 1)
         self.assertAlmostEqual(intervals[0][0], .8)
         self.assertAlmostEqual(intervals[0][1], 1.4)
+
+    def test_raw_face_cache_reuse_matches_fresh_analysis(self):
+        class MissingFace:
+            def __init__(self): self.count = 0
+            def detectMultiScale(self, *args, **kwargs):
+                self.count += 1
+                return [] if self.count in (1, 5, 6, 10, 11, 12, 15) else [(35, 15, 55, 55)]
+        old = copy.deepcopy(self.cfg)
+        old['face']['missing_tolerance_seconds'] = 0.0
+        self.cfg['face']['missing_tolerance_seconds'] = .4
+        with patch.object(cli, '_face_detector', return_value=MissingFace()):
+            raw, duration = cli.analyze_video(self.video, old, self.logger)
+        cache = self.video.with_suffix('.json')
+        cli._save_analysis_cache(cache, cli._analysis_signature(self.video, old), raw, duration)
+        reused = cli._reuse_raw_face_cache(self.video, cache, self.cfg)
+        with patch.object(cli, '_face_detector', return_value=MissingFace()):
+            fresh = cli.analyze_video(self.video, self.cfg, self.logger)
+        self.assertEqual(reused, fresh)
+        self.cfg['speech']['enabled'] = True
+        self.assertIsNone(cli._reuse_raw_face_cache(self.video, cache, self.cfg))
 
     def test_no_audio_does_not_remove_face(self):
         silent = self.video.with_name('silent.mp4')

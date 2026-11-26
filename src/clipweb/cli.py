@@ -488,6 +488,21 @@ def _load_analysis_cache(cache_path: Path, signature: str) -> tuple[list[tuple[f
         return None
 
 
+def _reuse_raw_face_cache(source: Path, cache_path: Path, cfg: dict) -> tuple[list[tuple[float, float]], float] | None:
+    """Apply a new face-gap tolerance to a matching zero-tolerance face-only cache."""
+    if not cfg['face']['enabled'] or cfg['speech']['enabled']:
+        return None
+    old_cfg = copy.deepcopy(cfg)
+    old_cfg['face']['missing_tolerance_seconds'] = 0.0
+    cached = _load_analysis_cache(cache_path, _analysis_signature(source, old_cfg))
+    if cached is None:
+        return None
+    intervals, duration = cached
+    step = 1.0 / float(cfg['analysis']['sample_fps'])
+    count = int(float(cfg['face']['missing_tolerance_seconds']) / step)
+    return merge_intervals(intervals, count * step + 1e-7), duration
+
+
 def _save_analysis_cache(cache_path: Path, signature: str,
                          intervals: list[tuple[float, float]], duration: float) -> None:
     _save_json_cache(cache_path, {"signature": signature, "duration": duration, "intervals": intervals})
@@ -879,6 +894,11 @@ def main() -> None:
                 signature = _analysis_signature(source, file_cfg)
                 cache_path = _analysis_cache_path(output_dir, source)
                 cached = None if file_cfg["processing"]["reanalyze"] else _load_analysis_cache(cache_path, signature)
+                if cached is None and not file_cfg["processing"]["reanalyze"]:
+                    cached = _reuse_raw_face_cache(source, cache_path, file_cfg)
+                    if cached is not None:
+                        _save_analysis_cache(cache_path, signature, *cached)
+                        logger.info("Reused raw face analysis with the new gap tolerance for %s", source.name)
                 if cached is None:
                     intervals, duration = analyze_video(source, file_cfg, logger, progress)
                     _save_analysis_cache(cache_path, signature, intervals, duration)
