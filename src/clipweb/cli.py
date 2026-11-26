@@ -20,6 +20,8 @@ from tqdm import tqdm
 import webrtcvad
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+SUMMARY_BAR_FORMAT = "{desc:<7}: {percentage:3.0f}%|{bar:24}| [{elapsed}]"
+STAGE_BAR_FORMAT = "{desc:<7}: {percentage:3.0f}%|{bar:24}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}, {rate_fmt}]{postfix}"
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -120,7 +122,8 @@ class FileProgress:
         self.stages = {name: 0.0 for name in stages}
         self.lock = threading.RLock()
         self.value = 0.0
-        self.bar = tqdm(total=100, desc="File", unit="%", position=1, leave=False, dynamic_ncols=True)
+        self.bar = tqdm(total=100, desc="File", unit="%", position=1, leave=False,
+                        dynamic_ncols=True, bar_format=SUMMARY_BAR_FORMAT)
 
     def update(self, stage: str, fraction: float) -> None:
         with self.lock:
@@ -139,9 +142,12 @@ class StageBar(tqdm):
     def __init__(self, *args, progress: FileProgress | None = None, stage: str = "", **kwargs):
         self.progress = progress
         self.stage = stage
+        kwargs.setdefault("bar_format", STAGE_BAR_FORMAT)
         super().__init__(*args, **kwargs)
 
     def update(self, n=1):
+        if self.total is not None:
+            n = min(n, max(0, self.total - self.n))
         result = super().update(n)
         if self.progress is not None and self.total:
             self.progress.update(self.stage, self.n / self.total)
@@ -209,7 +215,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                             if current_second > last_audio_second:
                                 bar.update(current_second - last_audio_second)
                                 last_audio_second = current_second
-                                bar.set_postfix(elapsed=f"{current_second/60:.1f}m", remaining=f"{max(0, duration-current_second)/60:.1f}m")
+                                bar.set_postfix(source=f"{current_second/60:.1f}/{duration/60:.1f}m")
                     for out in resampler.resample(None):
                         data = pending + out.to_ndarray().tobytes()
                         complete_bytes = len(data) // frame_bytes * frame_bytes
@@ -263,7 +269,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                         # Otherwise frame-rate rounding accumulates and leaves false face gaps.
                         next_sample = (idx + 1) * step
                         bar.update(1)
-                        bar.set_postfix(elapsed=f"{timestamp/60:.1f}m", remaining=f"{max(0,duration-timestamp)/60:.1f}m")
+                        bar.set_postfix(source=f"{timestamp/60:.1f}/{duration/60:.1f}m")
                         if timestamp >= duration:
                             break
             audio_task.result()
@@ -626,7 +632,8 @@ def main() -> None:
             logger.info("В %s нет видео. Положите туда файл или задайте paths.source в config.yaml", input_dir)
             return
         had_errors = False
-        overall = tqdm(total=len(sources), desc="Overall", unit="file", position=0, dynamic_ncols=True)
+        overall = tqdm(total=len(sources), desc="Overall", unit="file", position=0,
+                       dynamic_ncols=True, bar_format=SUMMARY_BAR_FORMAT)
         for source in sources:
             progress = FileProgress(overall, ("audio", "video", "smoking", "render"))
             if not source.is_file():
