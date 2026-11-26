@@ -6,3 +6,4 @@ output/
 work/
 logs/
 .coverage
+/config.yaml
