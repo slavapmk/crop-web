@@ -44,3 +44,5 @@ The console shows overall, per-file and stage progress. Overall percentages give
 ## Tests and limitations
 
 Run `uv run python -m unittest discover -s tests`. To measure and enforce the 95% line-coverage minimum, run `uv run python -m coverage run --source=clipweb -m unittest discover -s tests` followed by `uv run python -m coverage report`. Tests requiring FFmpeg are skipped if it is unavailable. Detection and output correctness depend on the source, webcam geometry, codec and model; review representative episodes before processing important material. Multiple faces or large layout changes can confuse automatic detection. Timestamps without presentation timestamps or in non-monotonic order cannot be mapped reliably to frame numbers and are rejected instead of guessed. Output names are zero-based video-frame indices, not audio sample numbers.
+
+If Windows temporarily denies FFmpeg access to an episode temporary file, the program retries up to three times using fresh temporary files. Persistent access failures are logged and the file is not reported as successfully rendered.

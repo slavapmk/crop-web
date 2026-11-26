@@ -22,7 +22,7 @@ import yaml
 from tqdm import tqdm
 import webrtcvad
 from clipweb.webcam import detect_webcam
-from clipweb.episodes import render_episodes
+from clipweb.episodes import OutputPermissionError, render_episodes
 from clipweb.aspect import crop_to_aspect
 from clipweb.progress import SUMMARY_BAR_FORMAT, STAGE_BAR_FORMAT
 from clipweb.smoking_regions import Detection, Region, build_blur_regions, map_regions, select_smoking_box
@@ -802,7 +802,12 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
                 code = proc.wait()
                 if code:
                     errors.seek(0)
-                    raise RuntimeError(f"ffmpeg failed with code {code}: {errors.read()[-2000:]}")
+                    detail = errors.read()[-2000:]
+                    message = f"ffmpeg failed with code {code}: {detail}"
+                    if (f"Error opening output {target}: Permission denied" in detail or
+                            f"Error opening output file {target}: Permission denied" in detail):
+                        raise OutputPermissionError(message)
+                    raise RuntimeError(message)
             finally:
                 if proc.poll() is None:
                     proc.kill()

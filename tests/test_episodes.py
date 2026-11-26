@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import av
-from clipweb.episodes import index_intervals, render_episodes
+from clipweb.episodes import OutputPermissionError, index_intervals, render_episodes
 from clipweb.cli import load_config, render_video
 
 
@@ -87,3 +87,29 @@ class EpisodeTests(unittest.TestCase):
         def render(source, target, intervals, cfg, logger, show_progress): target.write_bytes(b'video')
         render_episodes(*args, render, None, FakeBar)
         self.assertEqual((self.folder / '2-6.mp4').read_bytes(), b'video')
+
+    def test_temporary_output_access_denial_is_retried_with_new_file(self):
+        attempts = []
+        def render(source, target, intervals, cfg, logger, show_progress):
+            attempts.append(target)
+            if len(attempts) < 3:
+                raise OutputPermissionError('output is temporarily locked')
+            target.write_bytes(b'video')
+        with patch('clipweb.episodes.time.sleep') as sleep:
+            render_episodes(self.source, self.folder, self.cache, [(.2, .7)], {},
+                            logging.getLogger('test'), render, None, FakeBar)
+        self.assertEqual(len(set(attempts)), 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual((self.folder / '2-6.mp4').read_bytes(), b'video')
+        self.assertFalse(any(path.exists() for path in attempts))
+
+    def test_persistent_output_access_denial_is_reported(self):
+        attempts = []
+        def render(source, target, intervals, cfg, logger, show_progress):
+            attempts.append(target)
+            raise OutputPermissionError('output remains locked')
+        with patch('clipweb.episodes.time.sleep'), self.assertRaisesRegex(OutputPermissionError, 'remains locked'):
+            render_episodes(self.source, self.folder, self.cache, [(.2, .7)], {},
+                            logging.getLogger('test'), render, None, FakeBar)
+        self.assertEqual(len(attempts), 4)
+        self.assertFalse(any(path.exists() for path in attempts))

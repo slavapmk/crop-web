@@ -1,5 +1,6 @@
 import logging
 import io
+import os
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ import numpy as np
 from clipweb.cli import filter_short_intervals, load_config, render_video
 from clipweb.smoking_regions import map_regions
 from clipweb.episodes import render_episodes
+from clipweb.episodes import OutputPermissionError
 
 
 class QuietBar:
@@ -44,6 +46,29 @@ class FragmentTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is required')
 class RenderIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows file sharing semantics required')
+    def test_locked_output_is_classified_as_output_permission_error(self):
+        import ctypes
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, target = root / 'source.mp4', root / 'locked.mp4'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                            'color=s=128x96:d=1', '-c:v', 'libx264', str(source)], check=True)
+            target.touch()
+            config = root / 'config.yaml'
+            config.write_text('{}', encoding='utf8')
+            cfg = load_config(config)
+            cfg['webcam'] = dict(x=0, y=0, width=128, height=96)
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel.CreateFileW.restype = ctypes.c_void_p
+            handle = kernel.CreateFileW(str(target), 0x80000000, 0, None, 3, 0, None)
+            self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+            try:
+                with self.assertRaises(OutputPermissionError):
+                    render_video(source, target, [(0., .5)], cfg, logging.getLogger('test'), show_progress=False)
+            finally:
+                kernel.CloseHandle(ctypes.c_void_p(handle))
+
     def test_non_keyframe_segments_preserve_selected_video_and_audio(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

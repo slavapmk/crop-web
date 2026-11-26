@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 import av
@@ -14,6 +15,10 @@ from clipweb.smoking_regions import Region
 
 
 _FRAME_NAME = re.compile(r'^\d+-\d+\.mp4$')
+
+
+class OutputPermissionError(RuntimeError):
+    """FFmpeg could not open its output file due to access being denied."""
 
 
 def _write_manifest(path: Path, source: Path, names: set[str]) -> None:
@@ -100,18 +105,29 @@ def render_episodes(source: Path, folder: Path, cache_path: Path, intervals: lis
                    leave=False, dynamic_ncols=True, progress=progress, stage='render') as bar:
         for (start, end, _, _), name in zip(episodes, names):
             logger.debug('Rendering episode %s from %.6f to %.6f seconds', name, start, end)
-            fd, temporary = tempfile.mkstemp(prefix='.clipweb_', suffix='.mp4', dir=folder)
-            os.close(fd)
-            temp_path = Path(temporary)
-            try:
-                if blur_regions:
-                    render(source, temp_path, [(start, end)], cfg, logger,
-                           show_progress=False, blur_regions=blur_regions)
-                else:
-                    render(source, temp_path, [(start, end)], cfg, logger, show_progress=False)
-                os.replace(temp_path, folder / name)
-            finally:
-                temp_path.unlink(missing_ok=True)
+            for attempt in range(4):
+                fd, temporary = tempfile.mkstemp(prefix='.clipweb_', suffix='.mp4', dir=folder)
+                os.close(fd)
+                temp_path = Path(temporary)
+                try:
+                    if blur_regions:
+                        render(source, temp_path, [(start, end)], cfg, logger,
+                               show_progress=False, blur_regions=blur_regions)
+                    else:
+                        render(source, temp_path, [(start, end)], cfg, logger, show_progress=False)
+                    os.replace(temp_path, folder / name)
+                    break
+                except OutputPermissionError:
+                    if attempt == 3:
+                        raise
+                    logger.warning('Output access denied for %s; retrying with a new temporary file (%d/3)',
+                                   name, attempt + 1)
+                    time.sleep(.25 * (2 ** attempt))
+                finally:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except PermissionError:
+                        logger.warning('Could not remove temporary output: %s', temp_path)
             bar.update(1)
         if not episodes:
             bar.update(1)
