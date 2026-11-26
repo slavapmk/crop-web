@@ -30,6 +30,8 @@ class FragmentTests(unittest.TestCase):
         items = [(0., .2), (1., 1.5), (3., 4.)]
         self.assertEqual(filter_short_intervals(items, .5), items[1:])
         self.assertEqual(filter_short_intervals(items, 0), items)
+        self.assertEqual(filter_short_intervals([(0., 59.9), (100., 160.), (200., 261.)], 60.),
+                         [(100., 160.), (200., 261.)])
 
     def test_smoking_regions_are_mapped_across_cuts(self):
         intervals = [(1., 2.), (4., 6.)]

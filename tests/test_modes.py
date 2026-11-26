@@ -32,6 +32,7 @@ class ModeTests(unittest.TestCase):
         data = {'webcam': {'auto': True, 'samples': 8, 'x': 0, 'y': 0, 'width': 264, 'height': 168},
                 'smoking': {'model': 'model.onnx', 'enabled': True}}
         data.update(overrides)
+        data.setdefault('output', {})['min_segment_seconds'] = 0
         Path('config.yaml').write_text(yaml.safe_dump(data), encoding='utf-8')
         def smoking_result(*args, positions=None, **kwargs):
             if positions is not None:
@@ -59,6 +60,16 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(len(episodes.call_args.kwargs['blur_regions']), 1)
         self.assertEqual(episodes.call_args.kwargs['blur_regions'][0][2:], (94, 74, 22, 22))
         joined.assert_not_called()
+
+    def test_default_minimum_is_applied_before_episode_render(self):
+        config = {'webcam': {'auto': False}, 'aspect': {'enabled': False},
+                  'smoking': {'enabled': False}}
+        Path('config.yaml').write_text(yaml.safe_dump(config), encoding='utf8')
+        with patch.object(cli, 'analyze_video', return_value=([(0., 59.), (70., 130.), (140., 205.)], 205.)), \
+             patch.object(cli, 'render_episodes') as episodes, \
+             contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            cli.main()
+        self.assertEqual(episodes.call_args.args[3], [(70., 130.), (140., 205.)])
 
     def test_smoking_cut_mode_removes_events_instead_of_blurring(self):
         overrides = {'smoking': {'model': 'model.onnx', 'enabled': True, 'blur': False}}

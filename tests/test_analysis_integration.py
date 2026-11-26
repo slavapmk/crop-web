@@ -81,6 +81,22 @@ class AnalysisIntegrationTests(unittest.TestCase):
             intervals, _ = cli.analyze_video(self.video, self.cfg, self.logger)
         self.assertEqual(len(intervals), 2)
 
+    def test_face_tolerance_bridges_gaps_without_restoring_speech(self):
+        class MissingFace:
+            def __init__(self): self.count = 0
+            def detectMultiScale(self, *args, **kwargs):
+                self.count += 1
+                return [] if 5 <= self.count <= 7 else [(35, 15, 55, 55)]
+        self.cfg['speech'].update(enabled=True, method='mouth', invert=True)
+        self.cfg['analysis']['speech_padding_seconds'] = 0
+        with patch.object(cli, '_face_detector', return_value=MissingFace()), \
+             patch.object(cli, '_speech_evidence', return_value=(np.zeros(15, dtype=bool),
+                 np.array([False] * 4 + [True] * 3 + [False] * 8))):
+            intervals, _ = cli.analyze_video(self.video, self.cfg, self.logger)
+        self.assertEqual(len(intervals), 1)
+        self.assertAlmostEqual(intervals[0][0], .8)
+        self.assertAlmostEqual(intervals[0][1], 1.4)
+
     def test_no_audio_does_not_remove_face(self):
         silent = self.video.with_name('silent.mp4')
         subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(self.video),

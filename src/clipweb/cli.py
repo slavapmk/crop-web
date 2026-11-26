@@ -74,7 +74,7 @@ def load_config(path: Path) -> dict:
         "webcam": {"enabled": True, "auto": True, "samples": 24,
                    "x": 976, "y": 540, "width": 304, "height": 180},
         "processing": {"reanalyze": False},
-        "face": {"enabled": True, "missing_tolerance_seconds": 0.0},
+        "face": {"enabled": True, "missing_tolerance_seconds": 5.0},
         "speech": {"enabled": False, "method": "both", "invert": False},
         "aspect": {"enabled": True, "ratio": "16:10"},
         "mute": {"enabled": False},
@@ -93,7 +93,7 @@ def load_config(path: Path) -> dict:
                     "blur_margin_pixels": 6, "blur_hold_seconds": .35},
         "output": {"video_codec": "libx264", "preset": "veryfast", "crf": 23,
                    "audio_codec": "aac", "audio_bitrate": "160k", "join_gap_seconds": 0.0,
-                   "min_segment_seconds": 0.0, "split_episodes": True},
+                   "min_segment_seconds": 60.0, "split_episodes": True},
     }
     for section, values in defaults.items():
         config.setdefault(section, {})
@@ -433,7 +433,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
         for s, e in zip(starts, ends):
             if s > 0 and e < len(face_grid) and e - s <= tolerance:
                 # A tolerated face miss must never bypass the independent speech filter.
-                keep[s:e] = (keep[s-1] or keep[e]) & speech_keep[s:e]
+                keep[s:e] = speech_keep[s:e]
     # Convert retained sample mask into source-time intervals; pad each edge to avoid choppy cuts.
     intervals: list[tuple[float, float]] = []
     edges = np.flatnonzero(np.diff(np.r_[False, keep, False].astype(int)) != 0)

@@ -22,7 +22,8 @@ webcam:
 # Remove intervals where the face is not detected.
 face:
   enabled: true
-  missing_tolerance_seconds: 0.0
+  # Bridge brief missed detections between two confirmed faces.
+  missing_tolerance_seconds: 5.0
 
 # Remove speech independently from the face filter.
 speech:
@@ -87,8 +88,8 @@ output:
   audio_bitrate: 160k
   # Joining gaps can include previously filtered audio/video.
   join_gap_seconds: 0.0
-  # 0 keeps all non-empty episodes.
-  min_segment_seconds: 0.0
+  # Discard episodes shorter than one minute; 0 keeps all non-empty episodes.
+  min_segment_seconds: 60.0
 
 logging:
   console_level: INFO
