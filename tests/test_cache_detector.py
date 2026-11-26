@@ -60,10 +60,10 @@ class CacheAndDetectorTests(unittest.TestCase):
             self.assertEqual(fallback(np.zeros((1, 3, 640, 640), dtype=np.float32)).shape, result.shape)
 
     def test_config_rejects_invalid_modes_and_ratios(self):
-        for text in ('processing: {mode: invalid}', 'analysis: {speech_ratio: 0}',
-                     'analysis: {speech_detection: bad}',
-                     'output: {min_segment_seconds: -1}', 'processing: {min_segment_seconds: -1}',
-                     'processing: {face_missing_tolerance_seconds: -1}'):
+        for text in ('face: {enabled: wrong}', 'analysis: {speech_ratio: 0}',
+                     'speech: {method: bad}',
+                     'output: {min_segment_seconds: -1}', 'output: {split_episodes: maybe}',
+                     'face: {missing_tolerance_seconds: -1}'):
             path = self.root / 'bad.yaml'; path.write_text(text, encoding='utf8')
             with self.subTest(text=text), self.assertRaises(ValueError): cli.load_config(path)
 

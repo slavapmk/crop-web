@@ -1,27 +1,43 @@
-# All paths are relative to this configuration file unless absolute.
+# Paths are relative to this file unless absolute.
 paths:
   input: input
   output: output
   source: null
 
-# episodes: one file per face-present, non-smoking episode; legacy: one joined file.
 processing:
-  mode: episodes
   reanalyze: false
-  face_missing_tolerance_seconds: 0.0
-  # 0 keeps all non-empty episodes.
-  min_segment_seconds: 0.0
 
-# A single stable webcam rectangle is selected for the whole recording.
+# One fixed webcam rectangle is used for the entire recording.
 webcam:
+  # false uses the whole source frame instead of a webcam rectangle.
+  enabled: true
   auto: true
   samples: 24
-  # Used when auto is false, and in legacy mode.
+  # Used when auto is false.
   x: 976
   y: 540
   width: 304
   height: 180
 
+# Remove intervals where the face is not detected.
+face:
+  enabled: true
+  missing_tolerance_seconds: 0.0
+
+# Remove speech independently from the face filter.
+speech:
+  enabled: false
+  # both: voice and mouth motion; speech: voice only; mouth: mouth motion only.
+  method: both
+  # true keeps detected speech; false removes it.
+  invert: false
+
+# Crop the fixed webcam rectangle to an aspect ratio without stretching.
+aspect:
+  enabled: true
+  ratio: '16:10'
+
+# Shared analysis parameters.
 analysis:
   sample_fps: 5
   audio_sample_rate: 16000
@@ -32,11 +48,8 @@ analysis:
   speech_ratio: 0.2
   window_seconds: 0.6
   speech_padding_seconds: 0.35
-  face_missing_tolerance_seconds: 2.0
-  # These two settings apply only in legacy mode.
-  speech_detection: both
-  invert_speech: false
 
+# Remove probable smoking independently from face and speech filtering.
 smoking:
   enabled: true
   model: models/smoking_detector.onnx
@@ -53,17 +66,17 @@ smoking:
   threads: 2
 
 output:
-  # Fixed center crop in episodes mode; use source to retain webcam dimensions.
-  aspect_ratio: '16:10'
+  # true: separate numbered episodes; false: one concatenated video.
+  split_episodes: true
   video_codec: libx264
   preset: veryfast
   crf: 23
   audio_codec: aac
   audio_bitrate: 160k
-  # In legacy mode, join retained intervals separated by less than this.
-  join_gap_seconds: 0.25
-  # Used in legacy mode only.
-  min_segment_seconds: 0.5
+  # Joining gaps can include previously filtered audio/video.
+  join_gap_seconds: 0.0
+  # 0 keeps all non-empty episodes.
+  min_segment_seconds: 0.0
 
 logging:
   console_level: INFO

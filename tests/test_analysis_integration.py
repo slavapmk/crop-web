@@ -38,7 +38,7 @@ class AnalysisIntegrationTests(unittest.TestCase):
     def tearDown(self): self.tmp.cleanup()
 
     def test_face_mode_does_not_query_voice(self):
-        self.cfg['analysis']['speech_detection'] = 'face'
+        self.cfg['speech']['enabled'] = False
         with patch.object(cli, '_face_detector', return_value=Face()), \
              patch.object(cli.webrtcvad, 'Vad') as vad:
             vad.return_value.is_speech.side_effect = AssertionError('voice must not be analyzed')
@@ -47,8 +47,9 @@ class AnalysisIntegrationTests(unittest.TestCase):
         self.assertGreater(sum(end-start for start, end in intervals), 2.5)
         self.assertAlmostEqual(duration, 3.0, delta=.1)
 
-    def test_legacy_voice_and_motion_remove_speech(self):
-        self.cfg['analysis']['speech_detection'] = 'both'
+    def test_combined_voice_and_motion_remove_speech(self):
+        self.cfg['speech']['enabled'] = True
+        self.cfg['speech']['method'] = 'both'
         with patch.object(cli, '_face_detector', return_value=Face()), \
              patch.object(cli.webrtcvad, 'Vad', Voice), \
              patch.object(cli, '_mouth_motion', return_value=4.):
@@ -56,8 +57,9 @@ class AnalysisIntegrationTests(unittest.TestCase):
         self.assertLess(sum(end-start for start, end in intervals), .5)
 
     def test_mouth_mode_and_inverted_speech(self):
-        self.cfg['analysis']['speech_detection'] = 'mouth'
-        self.cfg['analysis']['invert_speech'] = True
+        self.cfg['speech']['enabled'] = True
+        self.cfg['speech']['method'] = 'mouth'
+        self.cfg['speech']['invert'] = True
         with patch.object(cli, '_face_detector', return_value=Face()), \
              patch.object(cli, '_mouth_motion', return_value=4.):
             intervals, _ = cli.analyze_video(self.video, self.cfg, self.logger)
@@ -69,12 +71,12 @@ class AnalysisIntegrationTests(unittest.TestCase):
             def detectMultiScale(self, *args, **kwargs):
                 self.count += 1
                 return [] if self.count == 5 else [(35, 15, 55, 55)]
-        self.cfg['analysis']['speech_detection'] = 'face'
-        self.cfg['analysis']['face_missing_tolerance_seconds'] = .2
+        self.cfg['speech']['enabled'] = False
+        self.cfg['face']['missing_tolerance_seconds'] = .2
         with patch.object(cli, '_face_detector', return_value=MissingFace()):
             intervals, _ = cli.analyze_video(self.video, self.cfg, self.logger)
         self.assertEqual(len(intervals), 1)
-        self.cfg['analysis']['face_missing_tolerance_seconds'] = 0
+        self.cfg['face']['missing_tolerance_seconds'] = 0
         with patch.object(cli, '_face_detector', return_value=MissingFace()):
             intervals, _ = cli.analyze_video(self.video, self.cfg, self.logger)
         self.assertEqual(len(intervals), 2)
@@ -83,10 +85,39 @@ class AnalysisIntegrationTests(unittest.TestCase):
         silent = self.video.with_name('silent.mp4')
         subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(self.video),
                         '-map', '0:v:0', '-c', 'copy', str(silent)], check=True, capture_output=True)
-        self.cfg['analysis']['speech_detection'] = 'speech'
+        self.cfg['speech']['enabled'] = True
+        self.cfg['speech']['method'] = 'speech'
         with patch.object(cli, '_face_detector', return_value=Face()):
             intervals, _ = cli.analyze_video(silent, self.cfg, self.logger)
         self.assertGreater(sum(end-start for start, end in intervals), 2.5)
+
+    def test_no_face_or_speech_filter_keeps_full_video_without_detectors(self):
+        self.cfg['face']['enabled'] = False
+        self.cfg['speech']['enabled'] = False
+        with patch.object(cli, '_face_detector', side_effect=AssertionError('face detector must not run')), \
+             patch.object(cli.webrtcvad, 'Vad', side_effect=AssertionError('VAD must not run')):
+            intervals, duration = cli.analyze_video(self.video, self.cfg, self.logger)
+        self.assertEqual(intervals, [(0., duration)])
+
+    def test_full_frame_uses_source_dimensions(self):
+        self.assertEqual(cli._full_frame_box(self.video), {'x': 0, 'y': 0, 'width': 128, 'height': 96})
+
+    def test_audio_only_speech_filter_works_without_face_detector(self):
+        self.cfg['face']['enabled'] = False
+        self.cfg['speech'].update(enabled=True, method='speech')
+        with patch.object(cli, '_face_detector', side_effect=AssertionError('face detector must not run')), \
+             patch.object(cli.webrtcvad, 'Vad', Voice):
+            intervals, _ = cli.analyze_video(self.video, self.cfg, self.logger)
+        self.assertLess(sum(end-start for start, end in intervals), .5)
+
+    def test_mouth_filter_without_face_filter_keeps_missing_faces(self):
+        class NoFace:
+            def detectMultiScale(self, *args, **kwargs): return []
+        self.cfg['face']['enabled'] = False
+        self.cfg['speech'].update(enabled=True, method='mouth')
+        with patch.object(cli, '_face_detector', return_value=NoFace()):
+            intervals, duration = cli.analyze_video(self.video, self.cfg, self.logger)
+        self.assertEqual(intervals, [(0., duration)])
 
     def test_smoking_hits_create_removal_intervals(self):
         self.cfg['smoking']['min_hits'] = 2

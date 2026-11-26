@@ -70,38 +70,40 @@ def load_config(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream) or {}
     defaults = {
-        "webcam": {"auto": True, "samples": 24, "x": 976, "y": 540, "width": 304, "height": 180},
-        "processing": {"mode": "episodes", "face_missing_tolerance_seconds": 0.0,
-                       "min_segment_seconds": 0.0, "reanalyze": False},
+        "webcam": {"enabled": True, "auto": True, "samples": 24,
+                   "x": 976, "y": 540, "width": 304, "height": 180},
+        "processing": {"reanalyze": False},
+        "face": {"enabled": True, "missing_tolerance_seconds": 0.0},
+        "speech": {"enabled": False, "method": "both", "invert": False},
+        "aspect": {"enabled": True, "ratio": "16:10"},
         "logging": {"console_level": "INFO", "file_level": "DEBUG"},
         "paths": {"input": "input", "output": "output", "source": None},
         "analysis": {"sample_fps": 5, "audio_sample_rate": 16000, "audio_frame_ms": 30,
                      "vad_aggressiveness": 2, "lip_motion_threshold": 2.8, "speech_ratio": .2,
                      "mouth_motion_ratio": .5,
-                     "window_seconds": .6, "speech_padding_seconds": .35,
-                     "face_missing_tolerance_seconds": 2,
-                     "speech_detection": "both", "invert_speech": False},
+                     "window_seconds": .6, "speech_padding_seconds": .35},
         "smoking": {"enabled": True, "model": "models/smoking_detector.onnx",
                     "sample_fps": 2.0, "input_size": 640, "confidence": .35,
                     "min_hits": 2, "max_gap_seconds": 2.5,
                     "padding_before_seconds": 1.0, "padding_after_seconds": 2.0,
                     "merge_gap_seconds": 4.0, "threads": 2, "backend": "auto", "device_id": 0},
         "output": {"video_codec": "libx264", "preset": "veryfast", "crf": 23,
-                   "audio_codec": "aac", "audio_bitrate": "160k", "join_gap_seconds": .25,
-                   "min_segment_seconds": .5, "aspect_ratio": "16:10"},
+                   "audio_codec": "aac", "audio_bitrate": "160k", "join_gap_seconds": 0.0,
+                   "min_segment_seconds": 0.0, "split_episodes": True},
     }
     for section, values in defaults.items():
         config.setdefault(section, {})
         for key, value in values.items():
             config[section].setdefault(key, value)
-    if config["analysis"]["speech_detection"] not in {"face", "speech", "both", "mouth"}:
-        raise ValueError("analysis.speech_detection must be face, speech, both, or mouth")
-    if config["processing"]["mode"] not in {"episodes", "legacy"}:
-        raise ValueError("processing.mode must be episodes or legacy")
-    if float(config["processing"]["face_missing_tolerance_seconds"]) < 0:
-        raise ValueError("processing.face_missing_tolerance_seconds must be nonnegative")
-    if float(config["processing"]["min_segment_seconds"]) < 0:
-        raise ValueError("processing.min_segment_seconds must be nonnegative")
+    if config["speech"]["method"] not in {"speech", "both", "mouth"}:
+        raise ValueError("speech.method must be speech, both, or mouth")
+    if float(config["face"]["missing_tolerance_seconds"]) < 0:
+        raise ValueError("face.missing_tolerance_seconds must be nonnegative")
+    for section, key in (("webcam", "enabled"), ("webcam", "auto"), ("face", "enabled"), ("speech", "enabled"),
+                         ("speech", "invert"), ("smoking", "enabled"), ("aspect", "enabled"),
+                         ("output", "split_episodes"), ("processing", "reanalyze")):
+        if not isinstance(config[section][key], bool):
+            raise ValueError(f"{section}.{key} must be true or false")
     for name in ("speech_ratio", "mouth_motion_ratio"):
         if not 0 < float(config["analysis"][name]) <= 1:
             raise ValueError(f"analysis.{name} must be greater than zero and at most one")
@@ -115,6 +117,15 @@ def _face_detector() -> cv2.CascadeClassifier:
     if cascade.empty():
         raise RuntimeError("OpenCV face detector could not be loaded")
     return cascade
+
+
+def _full_frame_box(source: Path) -> dict:
+    with av.open(str(source)) as container:
+        video = container.streams.video[0]
+        width, height = int(video.width) // 2 * 2, int(video.height) // 2 * 2
+    if width < 2 or height < 2:
+        raise ValueError("Video dimensions are invalid")
+    return {"x": 0, "y": 0, "width": width, "height": height}
 
 
 def _mouth_patch(gray: np.ndarray, face: tuple[int, int, int, int]) -> np.ndarray:
@@ -261,8 +272,14 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
         raise ValueError(f"Cannot determine duration: {path}")
     has_audio = bool(container.streams.audio)
     container.close()
-    vad = webrtcvad.Vad(int(a["vad_aggressiveness"]))
-    detector = _face_detector()
+    face_enabled = cfg["face"]["enabled"]
+    speech_enabled = cfg["speech"]["enabled"]
+    mode = cfg["speech"]["method"]
+    invert = cfg["speech"]["invert"]
+    need_face = face_enabled or (speech_enabled and mode in {"mouth", "both"})
+    need_audio = speech_enabled and mode in {"speech", "both"}
+    vad = webrtcvad.Vad(int(a["vad_aggressiveness"])) if need_audio else None
+    detector = _face_detector() if need_face else None
     step = 1.0 / float(a["sample_fps"])
     frame_count = max(1, math.ceil(duration / step))
     speech_counts = np.zeros(frame_count, dtype=np.int32)
@@ -274,7 +291,8 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
     # Each decoder owns its container; PyAV containers are not shared across threads.
     stop_audio = threading.Event()
     def analyze_audio() -> None:
-        if has_audio and a["speech_detection"] in {"speech", "both"}:
+        if has_audio and need_audio:
+            assert vad is not None
             with av.open(str(path)) as container:
                 audio_stream = container.streams.audio[0]
                 audio_stream.thread_type = "AUTO"
@@ -325,7 +343,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                         pending = data[complete_bytes:]
                         pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
                     bar.update(max(0, int(duration) - last_audio_second))
-        elif not has_audio and a["speech_detection"] in {"speech", "both"}:
+        elif not has_audio and need_audio:
             logger.warning("No audio stream; audio-based speech detection is unavailable")
         if progress is not None:
             progress.update("audio", 1.0)
@@ -338,7 +356,7 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                 video.thread_type = "AUTO"
                 with StageBar(total=frame_count, desc="Video", unit="frame", position=3, leave=False, dynamic_ncols=True, progress=progress, stage="video") as bar:
                     next_sample = 0.0
-                    for frame in container.decode(video=0):
+                    for frame in container.decode(video=0) if need_face else ():
                         timestamp = float(frame.pts * frame.time_base) if frame.pts is not None else 0.0
                         if timestamp + 1e-6 < next_sample:
                             continue
@@ -349,10 +367,11 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
                         valid = crop.size > 0 and crop.shape[0] >= 30 and crop.shape[1] >= 30
                         if valid:
                             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                            assert detector is not None
                             faces = detector.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=4, minSize=(40, 40))
                             present = len(faces) > 0
                             face_grid[idx] = present
-                            if present and a["speech_detection"] != "face":
+                            if present and speech_enabled and mode in {"mouth", "both"}:
                                 # Use the largest detected face; surrounding webcam movement cannot
                                 # dominate the mouth-motion score.
                                 face = max(faces, key=lambda item: int(item[2]) * int(item[3]))
@@ -376,45 +395,33 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileP
         progress.update("video", 1.0)
     # Speech evidence requires voice activity coincident with mouth motion, reducing game/other voices.
     vad_presence, moving = _speech_evidence(speech_counts, audio_counts, mouth_grid, a, step)
-    speech = vad_presence.copy()
-    if a["speech_detection"] == "both":
+    speech = vad_presence.copy() if speech_enabled else np.zeros(frame_count, dtype=bool)
+    if speech_enabled and mode == "both":
         speech &= moving
-    elif a["speech_detection"] == "mouth":
+    elif speech_enabled and mode == "mouth":
         speech = moving.copy()
-    speech &= face_grid
-    mode = a["speech_detection"]
-    if mode == "face":
-        keep = face_grid
-    else:
-        keep = face_grid & (~speech if not a["invert_speech"] else speech)
-    if mode == "face" and a["invert_speech"]:
-        logger.warning("invert_speech has no effect in face mode")
     # Remove a small guard interval around speech so word edges are not left audible.
     padding = max(0, int(math.ceil(float(a["speech_padding_seconds"]) / step)))
-    if padding and mode != "face":
+    if padding and speech_enabled:
         speech = np.convolve(np.pad(speech.astype(float), (padding, padding)),
                              np.ones(2 * padding + 1), mode="valid") > 0
-        keep = face_grid & (speech if a["invert_speech"] else ~speech)
-    logger.info("Analysis coverage: face %.1f%%, VAD %.1f%%, mouth motion %.1f%%, speech cuts %.1f%%",
-                100 * np.mean(face_grid), 100 * np.mean(vad_presence),
-                100 * np.mean(moving), 100 * np.mean(speech))
+    speech_keep = (speech if invert else ~speech) if speech_enabled else np.ones(frame_count, dtype=bool)
+    keep = (face_grid if face_enabled else np.ones(frame_count, dtype=bool)) & speech_keep
+    logger.info("Analysis coverage: face %s, VAD %s, mouth motion %s, speech cuts %s",
+                f"{100 * np.mean(face_grid):.1f}%" if need_face else "disabled",
+                f"{100 * np.mean(vad_presence):.1f}%" if need_audio else "disabled",
+                f"{100 * np.mean(moving):.1f}%" if speech_enabled and mode in {"mouth", "both"} else "disabled",
+                f"{100 * np.mean(speech):.1f}%" if speech_enabled else "disabled")
     # Bridge short face detector misses, but retain speech decisions as classified.
-    tolerance = max(0, int(float(a["face_missing_tolerance_seconds"]) / step))
-    if tolerance:
+    tolerance = max(0, int(float(cfg["face"]["missing_tolerance_seconds"]) / step))
+    if face_enabled and tolerance:
         missing = ~face_grid
         starts = np.flatnonzero(np.diff(np.r_[False, missing, False].astype(int)) == 1)
         ends = np.flatnonzero(np.diff(np.r_[False, missing, False].astype(int)) == -1)
         for s, e in zip(starts, ends):
             if s > 0 and e < len(face_grid) and e - s <= tolerance:
-                if mode != "face" and a["invert_speech"]:
-                    # In voice-only mode never bridge a face gap with silence.
-                    continue
-                if mode != "face":
-                    # Do not bridge over possible voice when lip evidence is unavailable.
-                    evidence = moving if mode == "mouth" else vad_presence
-                    keep[s:e] = (keep[s-1] or keep[e]) & ~evidence[s:e]
-                else:
-                    keep[s:e] = keep[s-1] or keep[e]
+                # A tolerated face miss must never bypass the independent speech filter.
+                keep[s:e] = (keep[s-1] or keep[e]) & speech_keep[s:e]
     # Convert retained sample mask into source-time intervals; pad each edge to avoid choppy cuts.
     intervals: list[tuple[float, float]] = []
     edges = np.flatnonzero(np.diff(np.r_[False, keep, False].astype(int)) != 0)
@@ -445,12 +452,14 @@ def _analysis_cache_path(output_dir: Path, source: Path) -> Path:
 def _analysis_signature(source: Path, cfg: dict) -> str:
     stat = source.stat()
     data = {
-        "analysis_version": 3,
+        "analysis_version": 4,
         "source": str(source.resolve()),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "webcam": cfg["webcam"],
         "analysis": cfg["analysis"],
+        "face": cfg["face"],
+        "speech": cfg["speech"],
     }
     encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -756,24 +765,20 @@ def main() -> None:
                 continue
             try:
                 file_cfg = copy.deepcopy(cfg)
-                episode_mode = file_cfg["processing"]["mode"] == "episodes"
-                if episode_mode:
-                    if file_cfg["webcam"]["auto"]:
-                        box = detect_webcam(source, int(file_cfg["webcam"]["samples"]), logger)
-                        file_cfg["webcam"].update(box)
-                    file_cfg["webcam"] = crop_to_aspect(file_cfg["webcam"], file_cfg["output"]["aspect_ratio"])
-                    logger.info("Fixed output rectangle: x=%d y=%d width=%d height=%d (aspect=%s)",
-                                file_cfg["webcam"]["x"], file_cfg["webcam"]["y"],
-                                file_cfg["webcam"]["width"], file_cfg["webcam"]["height"],
-                                file_cfg["output"]["aspect_ratio"])
-                    file_cfg["analysis"]["speech_detection"] = "face"
-                    file_cfg["analysis"]["invert_speech"] = False
-                    file_cfg["analysis"]["face_missing_tolerance_seconds"] = float(
-                        file_cfg["processing"]["face_missing_tolerance_seconds"])
-                    file_cfg["output"]["join_gap_seconds"] = 0.0
-                    file_cfg["output"]["min_segment_seconds"] = float(file_cfg["processing"]["min_segment_seconds"])
-                    logger.info("Episode mode: speech detection disabled; smoking filter enabled=%s",
-                                file_cfg["smoking"]["enabled"])
+                if not file_cfg["webcam"]["enabled"]:
+                    file_cfg["webcam"].update(_full_frame_box(source))
+                elif file_cfg["webcam"]["auto"]:
+                    box = detect_webcam(source, int(file_cfg["webcam"]["samples"]), logger)
+                    file_cfg["webcam"].update(box)
+                if file_cfg["aspect"]["enabled"]:
+                    file_cfg["webcam"] = crop_to_aspect(file_cfg["webcam"], file_cfg["aspect"]["ratio"])
+                logger.info("Fixed output rectangle: x=%d y=%d width=%d height=%d",
+                            file_cfg["webcam"]["x"], file_cfg["webcam"]["y"],
+                            file_cfg["webcam"]["width"], file_cfg["webcam"]["height"])
+                logger.info("Modules: webcam=%s face=%s speech=%s smoking=%s aspect=%s split_episodes=%s",
+                            file_cfg["webcam"]["enabled"], file_cfg["face"]["enabled"], file_cfg["speech"]["enabled"],
+                            file_cfg["smoking"]["enabled"], file_cfg["aspect"]["enabled"],
+                            file_cfg["output"]["split_episodes"])
                 signature = _analysis_signature(source, file_cfg)
                 cache_path = _analysis_cache_path(output_dir, source)
                 cached = None if file_cfg["processing"]["reanalyze"] else _load_analysis_cache(cache_path, signature)
@@ -811,8 +816,9 @@ def main() -> None:
                 intervals = filter_short_intervals(intervals, float(file_cfg["output"]["min_segment_seconds"]))
                 logger.info("Removed %d short fragments; %d remain (%.1f min)", before - len(intervals),
                             len(intervals), sum(end - start for start, end in intervals) / 60)
-                target = output_dir / source.stem if episode_mode else output_dir / f"{source.stem}_clipweb.mp4"
-                if episode_mode:
+                split = file_cfg["output"]["split_episodes"]
+                target = output_dir / source.stem if split else output_dir / f"{source.stem}_clipweb.mp4"
+                if split:
                     episode_cache = cache_path.with_name(cache_path.stem + "_episodes.json")
                     render_episodes(source, target, episode_cache, intervals, file_cfg, logger,
                                     render_video, progress, StageBar)

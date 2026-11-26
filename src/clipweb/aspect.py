@@ -13,7 +13,7 @@ def crop_to_aspect(box: dict, aspect: str | None) -> dict:
         if width_ratio <= 0 or height_ratio <= 0:
             raise ValueError
     except (TypeError, ValueError) as exc:
-        raise ValueError('output.aspect_ratio must be WIDTH:HEIGHT, source, or null') from exc
+        raise ValueError('aspect.ratio must be WIDTH:HEIGHT, source, or null') from exc
     divisor = math.gcd(width_ratio, height_ratio)
     width_ratio //= divisor
     height_ratio //= divisor

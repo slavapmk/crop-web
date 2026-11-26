@@ -28,47 +28,74 @@ class ModeTests(unittest.TestCase):
         os.chdir(self.previous)
         self.tmp.cleanup()
 
-    def run_mode(self, mode):
-        data = {'processing': {'mode': mode},
-                'webcam': {'auto': True, 'samples': 8, 'x': 0, 'y': 0, 'width': 264, 'height': 168},
-                'analysis': {'speech_detection': 'both', 'invert_speech': True},
-                'smoking': {'model': 'model.onnx', 'enabled': True},
-                'output': {'min_segment_seconds': 0.5, 'aspect_ratio': '16:10'}}
+    def run_modules(self, overrides):
+        data = {'webcam': {'auto': True, 'samples': 8, 'x': 0, 'y': 0, 'width': 264, 'height': 168},
+                'smoking': {'model': 'model.onnx', 'enabled': True}}
+        data.update(overrides)
         Path('config.yaml').write_text(yaml.safe_dump(data), encoding='utf-8')
         with patch.object(cli, 'detect_webcam', return_value={'x': 0, 'y': 0, 'width': 264, 'height': 168}) as detect, \
              patch.object(cli, 'analyze_video', return_value=([(0., 3.), (4., 8.)], 10.)) as analysis, \
              patch.object(cli, 'detect_smoking', return_value=[(1., 2.)]) as smoking, \
              patch.object(cli, 'render_episodes') as episodes, \
-             patch.object(cli, 'render_video') as legacy, \
+             patch.object(cli, 'render_video') as joined, \
              contextlib.redirect_stderr(io.StringIO()):
             cli.main()
-        return detect, analysis, smoking, episodes, legacy
+        return detect, analysis, smoking, episodes, joined
 
-    def test_episode_mode_forces_no_speech_and_separate_files(self):
-        detect, analysis, smoking, episodes, legacy = self.run_mode('episodes')
+    def test_default_modules_are_independent(self):
+        detect, analysis, smoking, episodes, joined = self.run_modules({})
         detect.assert_called_once()
         used_cfg = analysis.call_args.args[1]
-        self.assertEqual(used_cfg['analysis']['speech_detection'], 'face')
-        self.assertFalse(used_cfg['analysis']['invert_speech'])
+        self.assertTrue(used_cfg['face']['enabled'])
+        self.assertFalse(used_cfg['speech']['enabled'])
         self.assertEqual((used_cfg['webcam']['width'], used_cfg['webcam']['height']), (256, 160))
-        self.assertEqual(used_cfg['output']['join_gap_seconds'], 0)
         smoking.assert_called_once()
         episodes.assert_called_once()
         self.assertEqual(episodes.call_args.args[3], [(0., 1.), (2., 3.), (4., 8.)])
-        legacy.assert_not_called()
+        joined.assert_not_called()
 
-    def test_legacy_preserves_original_mode_and_rectangle(self):
-        detect, analysis, smoking, episodes, legacy = self.run_mode('legacy')
+    def test_modules_can_be_switched_independently(self):
+        overrides = {'webcam': {'auto': False, 'x': 0, 'y': 0, 'width': 264, 'height': 168},
+                     'face': {'enabled': False}, 'speech': {'enabled': True, 'method': 'speech'},
+                     'aspect': {'enabled': False}, 'smoking': {'enabled': False},
+                     'output': {'split_episodes': False}}
+        detect, analysis, smoking, episodes, joined = self.run_modules(overrides)
         detect.assert_not_called()
         used_cfg = analysis.call_args.args[1]
-        self.assertEqual(used_cfg['analysis']['speech_detection'], 'both')
-        self.assertTrue(used_cfg['analysis']['invert_speech'])
+        self.assertFalse(used_cfg['face']['enabled'])
+        self.assertTrue(used_cfg['speech']['enabled'])
+        self.assertEqual(used_cfg['speech']['method'], 'speech')
         self.assertEqual((used_cfg['webcam']['width'], used_cfg['webcam']['height']), (264, 168))
+        smoking.assert_not_called()
         episodes.assert_not_called()
-        legacy.assert_called_once()
+        joined.assert_called_once()
+        self.assertEqual(joined.call_args.args[2], [(0., 3.), (4., 8.)])
+
+    def test_speech_and_smoking_can_run_with_separate_episodes_without_face_filter(self):
+        overrides = {'face': {'enabled': False}, 'speech': {'enabled': True, 'method': 'both'},
+                     'smoking': {'enabled': True, 'model': 'model.onnx'},
+                     'output': {'split_episodes': True}}
+        _, analysis, smoking, episodes, joined = self.run_modules(overrides)
+        used_cfg = analysis.call_args.args[1]
+        self.assertFalse(used_cfg['face']['enabled'])
+        self.assertTrue(used_cfg['speech']['enabled'])
+        smoking.assert_called_once()
+        episodes.assert_called_once()
+        joined.assert_not_called()
+
+    def test_webcam_crop_can_be_disabled_independently(self):
+        overrides = {'webcam': {'enabled': False, 'auto': True},
+                     'aspect': {'enabled': False}, 'smoking': {'enabled': False}}
+        with patch.object(cli, '_full_frame_box', return_value={'x': 0, 'y': 0, 'width': 1280, 'height': 720}) as full:
+            detect, analysis, _, episodes, _ = self.run_modules(overrides)
+        full.assert_called_once()
+        detect.assert_not_called()
+        box = analysis.call_args.args[1]['webcam']
+        self.assertEqual((box['width'], box['height']), (1280, 720))
+        episodes.assert_called_once()
 
     def test_cached_analysis_and_smoking_are_reused(self):
-        cfg = {'processing': {'mode': 'legacy'}, 'smoking': {'model': 'model.onnx'}}
+        cfg = {'webcam': {'auto': False}, 'output': {'split_episodes': False}, 'smoking': {'model': 'model.onnx'}}
         Path('config.yaml').write_text(yaml.safe_dump(cfg), encoding='utf-8')
         with patch.object(cli, 'analyze_video', return_value=([(0., 3.)], 3.)) as analysis, \
              patch.object(cli, 'detect_smoking', return_value=[]) as smoking, \
@@ -81,7 +108,7 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(render.call_count, 2)
 
     def test_source_directory_and_disabled_smoking(self):
-        cfg = {'paths': {'source': 'input'}, 'processing': {'mode': 'legacy'},
+        cfg = {'paths': {'source': 'input'}, 'webcam': {'auto': False}, 'output': {'split_episodes': False},
                'smoking': {'enabled': False}}
         Path('config.yaml').write_text(yaml.safe_dump(cfg), encoding='utf-8')
         with patch.object(cli, 'analyze_video', return_value=([(0., 3.)], 3.)), \
@@ -102,7 +129,7 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(result.exception.code, 1)
 
     def test_missing_model_reports_failure(self):
-        cfg = {'processing': {'mode': 'legacy'}, 'smoking': {'model': 'missing.onnx'}}
+        cfg = {'webcam': {'auto': False}, 'output': {'split_episodes': False}, 'smoking': {'model': 'missing.onnx'}}
         Path('config.yaml').write_text(yaml.safe_dump(cfg), encoding='utf-8')
         with patch.object(cli, 'analyze_video', return_value=([(0., 3.)], 3.)), \
              contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
