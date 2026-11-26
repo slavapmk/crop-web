@@ -8,6 +8,8 @@ import math
 import os
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import av
@@ -93,7 +95,43 @@ def _sample_index(timestamp: float, step: float, frame_count: int) -> int:
     return min(frame_count - 1, max(0, int((timestamp + 1e-6) / step)))
 
 
-def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[tuple[float, float]], float]:
+class FileProgress:
+    """Track equally weighted stages, including concurrent analysis tasks."""
+
+    def __init__(self, overall: tqdm, stages: tuple[str, ...]):
+        self.overall = overall
+        self.stages = {name: 0.0 for name in stages}
+        self.lock = threading.RLock()
+        self.value = 0.0
+        self.bar = tqdm(total=100, desc="File", unit="%", position=1, leave=False, dynamic_ncols=True)
+
+    def update(self, stage: str, fraction: float) -> None:
+        with self.lock:
+            self.stages[stage] = max(self.stages[stage], min(1.0, max(0.0, fraction)))
+            value = sum(self.stages.values()) / len(self.stages)
+            delta = value - self.value
+            self.value = value
+            self.bar.update(delta * 100)
+            self.overall.update(delta)
+
+    def close(self) -> None:
+        self.bar.close()
+
+
+class StageBar(tqdm):
+    def __init__(self, *args, progress: FileProgress | None = None, stage: str = "", **kwargs):
+        self.progress = progress
+        self.stage = stage
+        super().__init__(*args, **kwargs)
+
+    def update(self, n=1):
+        result = super().update(n)
+        if self.progress is not None and self.total:
+            self.progress.update(self.stage, self.n / self.total)
+        return result
+
+
+def analyze_video(path: Path, cfg: dict, logger: logging.Logger, progress: FileProgress | None = None) -> tuple[list[tuple[float, float]], float]:
     a = cfg["analysis"]
     box = cfg["webcam"]
     container = av.open(str(path))
@@ -101,7 +139,8 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[t
     duration = float(container.duration / av.time_base) if container.duration else float(video.duration * video.time_base)
     if duration <= 0:
         raise ValueError(f"Cannot determine duration: {path}")
-    audio_stream = container.streams.audio[0] if container.streams.audio else None
+    has_audio = bool(container.streams.audio)
+    container.close()
     vad = webrtcvad.Vad(int(a["vad_aggressiveness"]))
     detector = _face_detector()
     step = 1.0 / float(a["sample_fps"])
@@ -111,91 +150,105 @@ def analyze_video(path: Path, cfg: dict, logger: logging.Logger) -> tuple[list[t
     mouth_grid = np.zeros(frame_count, dtype=float)
     previous = None
     logger.info("Анализ: %s (%.1f мин., шаг %.2f с)", path.name, duration / 60, step)
-    # Decode audio once for VAD; timestamps map voice activity back to the video timeline.
-    if audio_stream and a["speech_detection"] in {"speech", "both"}:
-        audio_stream.thread_type = "AUTO"
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=int(a["audio_sample_rate"]))
-        sample_rate = int(a["audio_sample_rate"])
-        frame_bytes = int(sample_rate * int(a["audio_frame_ms"]) / 1000) * 2
-        pending = b""
-        pending_start: float | None = None
-        audio_total = 0
-        with tqdm(total=max(1, int(duration)), desc="Анализ аудио", unit="с", dynamic_ncols=True) as bar:
-            last_audio_second = 0
-            for af in container.decode(audio=0):
-                for out in resampler.resample(af):
-                    data = out.to_ndarray().tobytes()
-                    start = float(out.pts * out.time_base) if out.pts is not None else audio_total / sample_rate
-                    audio_total += len(data) // 2
-                    origin = pending_start if pending else start
-                    data = pending + data
-                    complete_bytes = len(data) // frame_bytes * frame_bytes
-                    for offset in range(0, complete_bytes, frame_bytes):
-                        stamp = origin + offset / 2 / sample_rate
-                        try:
-                            spoken = vad.is_speech(data[offset:offset + frame_bytes], sample_rate)
-                        except Exception:
-                            spoken = False
-                        if spoken:
-                            idx = min(frame_count - 1, max(0, int(stamp / step)))
-                            speech_grid[idx] = True
-                    pending = data[complete_bytes:]
-                    pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
-                    current_second = min(int(duration), max(0, int(start)))
-                    bar.update(max(0, current_second - last_audio_second))
-                    last_audio_second = current_second
-                    bar.set_postfix(elapsed=f"{current_second/60:.1f}m", remaining=f"{max(0, duration-current_second)/60:.1f}m")
-            for out in resampler.resample(None):
-                data = pending + out.to_ndarray().tobytes()
-                complete_bytes = len(data) // frame_bytes * frame_bytes
-                origin = pending_start or 0.0
-                for offset in range(0, complete_bytes, frame_bytes):
-                    if vad.is_speech(data[offset:offset + frame_bytes], sample_rate):
-                        idx = min(frame_count - 1, max(0, int((origin + offset / 2 / sample_rate) / step)))
-                        speech_grid[idx] = True
-                pending = data[complete_bytes:]
-                pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
-            bar.update(max(0, int(duration) - last_audio_second))
-    elif not audio_stream and a["speech_detection"] in {"speech", "both"}:
-        logger.warning("Аудиодорожка не найдена; речь можно оценить только по движению лица")
-    # Reopen after audio decode, then sample webcam frames at configured cadence.
-    container.close()
-    container = av.open(str(path))
-    video = container.streams.video[0]
-    with tqdm(total=frame_count, desc="Анализ кадров", unit="кадр", dynamic_ncols=True) as bar:
-        next_sample = 0.0
-        for frame in container.decode(video=0):
-            timestamp = float(frame.pts * frame.time_base) if frame.pts is not None else 0.0
-            if timestamp + 1e-6 < next_sample:
-                continue
-            idx = _sample_index(timestamp, step, frame_count)
-            image = frame.to_ndarray(format="bgr24")
-            x, y, w, h = (int(box[k]) for k in ("x", "y", "width", "height"))
-            crop = image[max(0, y):min(image.shape[0], y+h), max(0, x):min(image.shape[1], x+w)]
-            valid = crop.size > 0 and crop.shape[0] >= 30 and crop.shape[1] >= 30
-            if valid:
-                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                faces = detector.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=4, minSize=(40, 40))
-                present = len(faces) > 0
-                face_grid[idx] = present
-                if present:
-                    # Use the largest detected face; surrounding webcam movement cannot
-                    # dominate the mouth-motion score.
-                    face = max(faces, key=lambda item: int(item[2]) * int(item[3]))
-                    mouth = _mouth_patch(gray, tuple(map(int, face)))
-                    motion = _mouth_motion(mouth, previous)
-                    mouth_grid[idx] = motion
-                    previous = mouth
-                else:
-                    previous = None
-            # Anchor sampling to the fixed grid, not to the last decoded frame.
-            # Otherwise frame-rate rounding accumulates and leaves false face gaps.
-            next_sample = (idx + 1) * step
-            bar.update(1)
-            bar.set_postfix(elapsed=f"{timestamp/60:.1f}m", remaining=f"{max(0,duration-timestamp)/60:.1f}m")
-            if timestamp >= duration:
-                break
-    container.close()
+    # Each decoder owns its container; PyAV containers are not shared across threads.
+    stop_audio = threading.Event()
+    def analyze_audio() -> None:
+        if has_audio and a["speech_detection"] in {"speech", "both"}:
+            with av.open(str(path)) as container:
+                audio_stream = container.streams.audio[0]
+                audio_stream.thread_type = "AUTO"
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=int(a["audio_sample_rate"]))
+                sample_rate = int(a["audio_sample_rate"])
+                frame_bytes = int(sample_rate * int(a["audio_frame_ms"]) / 1000) * 2
+                pending = b""
+                pending_start: float | None = None
+                audio_total = 0
+                with StageBar(total=max(1, int(duration)), desc="Audio", unit="s", position=2, leave=False, dynamic_ncols=True, progress=progress, stage="audio") as bar:
+                    last_audio_second = 0
+                    for af in container.decode(audio=0):
+                        if stop_audio.is_set():
+                            return
+                        for out in resampler.resample(af):
+                            data = out.to_ndarray().tobytes()
+                            start = float(out.pts * out.time_base) if out.pts is not None else audio_total / sample_rate
+                            audio_total += len(data) // 2
+                            origin = pending_start if pending else start
+                            data = pending + data
+                            complete_bytes = len(data) // frame_bytes * frame_bytes
+                            for offset in range(0, complete_bytes, frame_bytes):
+                                stamp = origin + offset / 2 / sample_rate
+                                try:
+                                    spoken = vad.is_speech(data[offset:offset + frame_bytes], sample_rate)
+                                except Exception:
+                                    spoken = False
+                                if spoken:
+                                    idx = min(frame_count - 1, max(0, int(stamp / step)))
+                                    speech_grid[idx] = True
+                            pending = data[complete_bytes:]
+                            pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
+                            current_second = min(int(duration), max(0, int(start)))
+                            bar.update(max(0, current_second - last_audio_second))
+                            last_audio_second = current_second
+                            bar.set_postfix(elapsed=f"{current_second/60:.1f}m", remaining=f"{max(0, duration-current_second)/60:.1f}m")
+                    for out in resampler.resample(None):
+                        data = pending + out.to_ndarray().tobytes()
+                        complete_bytes = len(data) // frame_bytes * frame_bytes
+                        origin = pending_start or 0.0
+                        for offset in range(0, complete_bytes, frame_bytes):
+                            if vad.is_speech(data[offset:offset + frame_bytes], sample_rate):
+                                idx = min(frame_count - 1, max(0, int((origin + offset / 2 / sample_rate) / step)))
+                                speech_grid[idx] = True
+                        pending = data[complete_bytes:]
+                        pending_start = origin + complete_bytes / 2 / sample_rate if pending else None
+                    bar.update(max(0, int(duration) - last_audio_second))
+        elif not has_audio and a["speech_detection"] in {"speech", "both"}:
+            logger.warning("Аудиодорожка не найдена; речь можно оценить только по движению лица")
+        if progress is not None:
+            progress.update("audio", 1.0)
+    # Analyze audio and video concurrently using independent demuxers.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        audio_task = executor.submit(analyze_audio)
+        try:
+            with av.open(str(path)) as container:
+                video = container.streams.video[0]
+                with StageBar(total=frame_count, desc="Video", unit="frame", position=3, leave=False, dynamic_ncols=True, progress=progress, stage="video") as bar:
+                    next_sample = 0.0
+                    for frame in container.decode(video=0):
+                        timestamp = float(frame.pts * frame.time_base) if frame.pts is not None else 0.0
+                        if timestamp + 1e-6 < next_sample:
+                            continue
+                        idx = _sample_index(timestamp, step, frame_count)
+                        image = frame.to_ndarray(format="bgr24")
+                        x, y, w, h = (int(box[k]) for k in ("x", "y", "width", "height"))
+                        crop = image[max(0, y):min(image.shape[0], y+h), max(0, x):min(image.shape[1], x+w)]
+                        valid = crop.size > 0 and crop.shape[0] >= 30 and crop.shape[1] >= 30
+                        if valid:
+                            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                            faces = detector.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=4, minSize=(40, 40))
+                            present = len(faces) > 0
+                            face_grid[idx] = present
+                            if present:
+                                # Use the largest detected face; surrounding webcam movement cannot
+                                # dominate the mouth-motion score.
+                                face = max(faces, key=lambda item: int(item[2]) * int(item[3]))
+                                mouth = _mouth_patch(gray, tuple(map(int, face)))
+                                motion = _mouth_motion(mouth, previous)
+                                mouth_grid[idx] = motion
+                                previous = mouth
+                            else:
+                                previous = None
+                        # Anchor sampling to the fixed grid, not to the last decoded frame.
+                        # Otherwise frame-rate rounding accumulates and leaves false face gaps.
+                        next_sample = (idx + 1) * step
+                        bar.update(1)
+                        bar.set_postfix(elapsed=f"{timestamp/60:.1f}m", remaining=f"{max(0,duration-timestamp)/60:.1f}m")
+                        if timestamp >= duration:
+                            break
+            audio_task.result()
+        finally:
+            stop_audio.set()
+    if progress is not None:
+        progress.update("video", 1.0)
     # Speech evidence requires voice activity coincident with mouth motion, reducing game/other voices.
     radius = max(1, int(round(float(a["window_seconds"]) / step / 2)))
     window = np.ones(2 * radius + 1)
@@ -325,7 +378,7 @@ def _smoking_signature(base_signature: str, cfg: dict, model_path: Path) -> str:
 
 
 def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict,
-                   model_path: Path, logger: logging.Logger) -> list[tuple[float, float]]:
+                   model_path: Path, logger: logging.Logger, progress: FileProgress | None = None) -> list[tuple[float, float]]:
     """Find smoking events only inside already-retained face/silent ranges."""
     s = cfg["smoking"]
     cv2.setNumThreads(int(s["threads"]))
@@ -351,7 +404,7 @@ def detect_smoking(source: Path, intervals: list[tuple[float, float]], cfg: dict
     x, y, w, h = (int(box[k]) for k in ("x", "y", "width", "height"))
     model_size = int(s["input_size"])
     hits: list[float] = []
-    with tqdm(total=len(sample_times), desc="Анализ курения", unit="кадр", dynamic_ncols=True) as bar:
+    with StageBar(total=len(sample_times), desc="Smoking", unit="frame", position=2, leave=False, dynamic_ncols=True, progress=progress, stage="smoking") as bar:
         for sample_time in sample_times:
             video.seek(max(0, int(sample_time / float(stream.time_base))),
                        stream=stream, backward=True, any_frame=False)
@@ -422,7 +475,7 @@ def subtract_intervals(base: list[tuple[float, float]], removals: list[tuple[flo
     return [(start, end) for start, end in result if end > start]
 
 
-def render_video(source: Path, target: Path, intervals: list[tuple[float, float]], cfg: dict, logger: logging.Logger) -> None:
+def render_video(source: Path, target: Path, intervals: list[tuple[float, float]], cfg: dict, logger: logging.Logger, progress: FileProgress | None = None) -> None:
     if not intervals:
         logger.warning("Нет подходящих фрагментов: %s", source.name)
         return
@@ -455,7 +508,7 @@ def render_video(source: Path, target: Path, intervals: list[tuple[float, float]
         duration = sum(end - start for start, end in intervals)
         logger.info("Сборка %s: %.1f мин. из %d фрагментов (переходы к отрезкам)", target.name, duration/60, len(intervals))
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-        with tqdm(total=max(0.1, duration), desc="Сборка", unit="с", dynamic_ncols=True) as bar:
+        with StageBar(total=max(0.1, duration), desc="Render", unit="s", position=2, leave=False, dynamic_ncols=True, progress=progress, stage="render") as bar:
             last = 0.0
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -500,22 +553,29 @@ def main() -> None:
             logger.info("В %s нет видео. Положите туда файл или задайте paths.source в config.yaml", input_dir)
             return
         had_errors = False
+        overall = tqdm(total=len(sources), desc="Overall", unit="file", position=0, dynamic_ncols=True)
         for source in sources:
+            progress = FileProgress(overall, ("audio", "video", "smoking", "render"))
             if not source.is_file():
                 logger.error("Файл не найден: %s", source)
                 had_errors = True
+                for stage in progress.stages:
+                    progress.update(stage, 1.0)
+                progress.close()
                 continue
             try:
                 signature = _analysis_signature(source, cfg)
                 cache_path = _analysis_cache_path(output_dir, source)
                 cached = None if args.reanalyze else _load_analysis_cache(cache_path, signature)
                 if cached is None:
-                    intervals, duration = analyze_video(source, cfg, logger)
+                    intervals, duration = analyze_video(source, cfg, logger, progress)
                     _save_analysis_cache(cache_path, signature, intervals, duration)
                     logger.info("Результат анализа сохранён до сборки")
                 else:
                     intervals, duration = cached
                     logger.info("Использую сохранённый анализ для %s", source.name)
+                progress.update("audio", 1.0)
+                progress.update("video", 1.0)
                 intervals = merge_intervals(intervals, float(cfg["output"]["join_gap_seconds"]))
                 if cfg["smoking"]["enabled"]:
                     model_path = Path(cfg["smoking"]["model"])
@@ -527,7 +587,7 @@ def main() -> None:
                     smoking_signature = _smoking_signature(signature, cfg, model_path)
                     cached_smoking = None if args.reanalyze else _load_analysis_cache(smoking_cache, smoking_signature)
                     if cached_smoking is None:
-                        smoking_events = detect_smoking(source, intervals, cfg, model_path, logger)
+                        smoking_events = detect_smoking(source, intervals, cfg, model_path, logger, progress)
                         _save_analysis_cache(smoking_cache, smoking_signature, smoking_events, duration)
                     else:
                         smoking_events, _ = cached_smoking
@@ -536,13 +596,19 @@ def main() -> None:
                     logger.info("Selected after smoking filter: %.1f%%",
                                 100 * sum(end - start for start, end in intervals) / duration)
                     logger.info("После вырезания курения осталось фрагментов: %d", len(intervals))
+                progress.update("smoking", 1.0)
                 target = output_dir / f"{source.stem}_clipweb.mp4"
-                render_video(source, target, intervals, cfg, logger)
+                render_video(source, target, intervals, cfg, logger, progress)
                 logger.info("Готово: %s (сохранено %.1f%% длительности)", target.name,
                             100 * sum(e-s for s, e in intervals) / duration if intervals else 0)
             except Exception as exc:
                 had_errors = True
                 logger.exception("Ошибка при обработке %s: %s", source.name, exc)
+            finally:
+                for stage in progress.stages:
+                    progress.update(stage, 1.0)
+                progress.close()
+        overall.close()
         if had_errors:
             sys.exit(1)
     except Exception as exc:

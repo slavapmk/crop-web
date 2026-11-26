@@ -30,3 +30,5 @@ The analysis log reports the percentage of samples with a detected face, voice a
 `analysis.speech_detection: both` combines mouth motion with voice activity; `mouth` uses motion alone. Neither reliably distinguishes speech from eating, drinking, yawning or background voices. Smoking detection is experimental and can also produce false positives. Validate these settings on representative footage.
 
 [Русская версия](README.ru.md)
+
+Audio and video analysis run concurrently with separate decoders. The overall and per-file bars represent equally weighted audio analysis, video analysis, smoking detection and rendering stages; they are progress estimates, not elapsed-time predictions. Cached or disabled stages complete immediately. Concurrent reads can increase load on the storage and CPU.
